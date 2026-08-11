@@ -13,6 +13,9 @@
   button:hover { background: #ad86e8; }
   input[type=range] { flex: 1; }
   #frameLabel { min-width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
+  select { background: #1f2330; border: 1px solid #3a3f52; color: #e6e0fa; padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+  #legend { display: flex; align-items: center; gap: 18px; font-size: 12px; color: #b8b2d4; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
 </style>
 </head>
 <body>
@@ -22,6 +25,21 @@
       <button id="playBtn">Play</button>
       <input type="range" id="slider" min="0" value="0" step="1" />
       <span id="frameLabel">0 / 0</span>
+      <label for="speed" style="font-size:12px;color:#b8b2d4;">Speed</label>
+      <select id="speed">
+        <option value="4">0.25x</option>
+        <option value="2">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="0.5">2x</option>
+        <option value="0.25">4x</option>
+      </select>
+    </div>
+    <div id="row">
+      <div id="legend">
+        <span><span class="swatch" style="background:#ff6a5c"></span>Right side</span>
+        <span><span class="swatch" style="background:#5cc8ff"></span>Left side</span>
+        <span><span class="swatch" style="background:#e6e0fa"></span>Center / torso</span>
+      </div>
     </div>
   </div>
 
@@ -31,9 +49,31 @@ const frames = DATA.frames;
 const bones = DATA.bones;
 const numFrames = frames.length;
 
-const lineColor = "rgb(155,111,224)";
-const jointColor = "rgb(230,220,250)";
+const RIGHT_COLOR = "rgb(255,106,92)";  // warm red -- viewer's... the subject's right side
+const LEFT_COLOR = "rgb(92,200,255)";   // cool blue -- subject's left side
+const CENTER_COLOR = "rgb(230,220,250)";
 const bgColor = "#14171F";
+
+// MediaPipe pose landmark indices: odd = subject's left, even = subject's
+// right (0 = nose, treated as center). "neck"/"head" synthetic keys are
+// center. This lets bones/joints be colored by side without any extra
+// metadata from the Python export.
+function sideOf(key) {
+  if (key === "head" || key === "neck") return "center";
+  const n = parseInt(key, 10);
+  if (Number.isNaN(n) || n === 0) return "center";
+  return n % 2 === 1 ? "left" : "right";
+}
+function colorForSide(side) {
+  if (side === "left") return LEFT_COLOR;
+  if (side === "right") return RIGHT_COLOR;
+  return CENTER_COLOR;
+}
+
+// Larger markers on the joints that matter most for reading exercise
+// form at a glance; everything else stays small so it doesn't clutter
+// the figure.
+const MAJOR_JOINTS = new Set([11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]);
 
 function frameToTraces(points) {
   const boneTraces = [];
@@ -45,26 +85,35 @@ function frameToTraces(points) {
     const pa = points[String(a)];
     const pb = points[String(b)];
     if (!pa || !pb) continue;
+    const sideA = sideOf(String(a));
+    const sideB = sideOf(String(b));
+    // Only color a bone by side if both endpoints agree; cross-body
+    // bones (shoulder-to-shoulder, hip-to-hip, spine, neck) stay neutral
+    // so left/right reads unambiguously at a glance.
+    const side = sideA === sideB ? sideA : "center";
     boneTraces.push({
       type: "scatter3d",
       mode: "lines",
       x: [pa[0], pb[0]], y: [pa[1], pb[1]], z: [pa[2], pb[2]],
-      line: { color: lineColor, width: 8 },
+      line: { color: colorForSide(side), width: side === "center" ? 7 : 10 },
       hoverinfo: "skip",
       showlegend: false,
     });
   }
 
-  const jx = [], jy = [], jz = [], jsize = [];
+  const jx = [], jy = [], jz = [], jsize = [], jcolor = [];
   for (const [k, v] of Object.entries(points)) {
     jx.push(v[0]); jy.push(v[1]); jz.push(v[2]);
-    jsize.push(k === "head" ? 16 : 6);
+    const n = parseInt(k, 10);
+    const isMajor = k === "head" || MAJOR_JOINTS.has(n);
+    jsize.push(k === "head" ? 16 : isMajor ? 11 : 5);
+    jcolor.push(k === "head" ? CENTER_COLOR : colorForSide(sideOf(k)));
   }
   const jointTrace = {
     type: "scatter3d",
     mode: "markers",
     x: jx, y: jy, z: jz,
-    marker: { color: jointColor, size: jsize },
+    marker: { color: jcolor, size: jsize, line: { color: bgColor, width: 1 } },
     hoverinfo: "skip",
     showlegend: false,
   };
@@ -92,6 +141,7 @@ Plotly.newPlot(plotDiv, frameToTraces(frames[0] || {}), layout, { displaylogo: f
 const slider = document.getElementById("slider");
 const frameLabel = document.getElementById("frameLabel");
 const playBtn = document.getElementById("playBtn");
+const speedSelect = document.getElementById("speed");
 slider.max = Math.max(0, numFrames - 1);
 
 function showFrame(i) {
@@ -104,19 +154,30 @@ slider.addEventListener("input", () => showFrame(parseInt(slider.value, 10)));
 
 let playing = false;
 let playTimer = null;
+
+function startPlayTimer() {
+  clearInterval(playTimer);
+  const intervalMs = 33 * parseFloat(speedSelect.value);
+  playTimer = setInterval(() => {
+    let next = parseInt(slider.value, 10) + 1;
+    if (next > numFrames - 1) next = 0;
+    slider.value = next;
+    showFrame(next);
+  }, intervalMs);
+}
+
 playBtn.addEventListener("click", () => {
   playing = !playing;
   playBtn.textContent = playing ? "Pause" : "Play";
   if (playing) {
-    playTimer = setInterval(() => {
-      let next = parseInt(slider.value, 10) + 1;
-      if (next > numFrames - 1) next = 0;
-      slider.value = next;
-      showFrame(next);
-    }, 33);
+    startPlayTimer();
   } else {
     clearInterval(playTimer);
   }
+});
+
+speedSelect.addEventListener("change", () => {
+  if (playing) startPlayTimer();
 });
 </script>
 </body>

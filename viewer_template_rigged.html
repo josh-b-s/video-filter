@@ -35,6 +35,10 @@
       <button id="loadBtn">Load model</button>
     </div>
     <div id="row">
+      <label for="modelFile">or local file</label>
+      <input type="file" id="modelFile" accept=".glb,.gltf" />
+    </div>
+    <div id="row">
       <button id="playBtn" disabled>Play</button>
       <input type="range" id="slider" min="0" value="0" step="1" disabled />
       <span id="frameLabel">0 / 0</span>
@@ -58,6 +62,7 @@ const frameLabel = document.getElementById("frameLabel");
 const playBtn = document.getElementById("playBtn");
 const loadBtn = document.getElementById("loadBtn");
 const modelUrlInput = document.getElementById("modelUrl");
+const modelFileInput = document.getElementById("modelFile");
 
 // ---------- Three.js scene ----------
 const container = document.getElementById("plot");
@@ -102,21 +107,29 @@ animateLoop();
 // {x,y,z}) for these keys. Adjust the mixamorig names on the right if
 // your specific model uses different bone names (open it in a GLTF
 // inspector, e.g. https://gltf-viewer.donmccurdy.com, to check).
+// Canonical Mixamo bone suffixes (i.e. the bone name with any
+// "mixamorig" / "mixamorigN" / "mixamorig_N" prefix stripped off).
+// Actual lookup happens via resolveBoneName() below, which matches
+// bones on this suffix regardless of what numeral (if any) Mixamo
+// tacked onto the prefix -- so this works whether the model's bones
+// are named mixamorigHips, mixamorig1Hips, mixamorig2Hips, etc.
 const BONE_MAP = {
-  Hips: "mixamorigHips",
-  Spine: "mixamorigSpine",
-  LeftUpperArm: "mixamorigLeftArm",
-  LeftLowerArm: "mixamorigLeftForeArm",
-  LeftHand: "mixamorigLeftHand",
-  RightUpperArm: "mixamorigRightArm",
-  RightLowerArm: "mixamorigRightForeArm",
-  RightHand: "mixamorigRightHand",
-  LeftUpperLeg: "mixamorigLeftUpLeg",
-  LeftLowerLeg: "mixamorigLeftLeg",
-  LeftFoot: "mixamorigLeftFoot",
-  RightUpperLeg: "mixamorigRightUpLeg",
-  RightLowerLeg: "mixamorigRightLeg",
-  RightFoot: "mixamorigRightFoot",
+  Hips: "Hips",
+  Spine: "Spine",
+  Neck: "Neck",
+  Head: "Head",
+  LeftUpperArm: "LeftArm",
+  LeftLowerArm: "LeftForeArm",
+  LeftHand: "LeftHand",
+  RightUpperArm: "RightArm",
+  RightLowerArm: "RightForeArm",
+  RightHand: "RightHand",
+  LeftUpperLeg: "LeftUpLeg",
+  LeftLowerLeg: "LeftLeg",
+  LeftFoot: "LeftFoot",
+  RightUpperLeg: "RightUpLeg",
+  RightLowerLeg: "RightLeg",
+  RightFoot: "RightFoot",
 };
 
 // Per-bone axis sign flips. Mixamo rigs are fairly consistent, but if a
@@ -131,7 +144,8 @@ const AXIS_FLIP = {
 };
 
 let currentModel = null;
-let currentSkeletonBones = {}; // mixamo name -> THREE.Bone
+let currentSkeletonBones = {}; // actual bone name (as found on model) -> THREE.Bone
+let resolvedBones = {};        // BONE_MAP logical key -> THREE.Bone
 let hipsBone = null;
 let initialHipsY = 0;
 
@@ -143,11 +157,32 @@ function collectBones(root) {
   return map;
 }
 
+// Matches "mixamorigHips", "mixamorig1Hips", "mixamorig_2_Hips", etc.
+// -- any "mixamorig" prefix, optionally followed by digits/underscores,
+// followed by the canonical suffix (e.g. "Hips", "LeftForeArm").
+function resolveBoneName(bonesMap, suffix) {
+  const pattern = new RegExp("^mixamorig[_0-9]*" + suffix + "$", "i");
+  for (const name of Object.keys(bonesMap)) {
+    if (pattern.test(name)) return name;
+  }
+  return null;
+}
+
+function resolveAllBones(bonesMap) {
+  const resolved = {};
+  for (const [logicalKey, suffix] of Object.entries(BONE_MAP)) {
+    const actualName = resolveBoneName(bonesMap, suffix);
+    if (actualName) resolved[logicalKey] = bonesMap[actualName];
+  }
+  return resolved;
+}
+
 function clearModel() {
   if (currentModel) {
     scene.remove(currentModel);
     currentModel = null;
     currentSkeletonBones = {};
+    resolvedBones = {};
     hipsBone = null;
   }
 }
@@ -162,16 +197,38 @@ function loadModel(url) {
       currentModel = gltf.scene;
       scene.add(currentModel);
       currentSkeletonBones = collectBones(currentModel);
-      hipsBone = currentSkeletonBones[BONE_MAP.Hips] || null;
+      resolvedBones = resolveAllBones(currentSkeletonBones);
+      hipsBone = resolvedBones.Hips || null;
       initialHipsY = hipsBone ? hipsBone.position.y : 0;
 
-      const missing = Object.values(BONE_MAP).filter((n) => !currentSkeletonBones[n]);
+      // Auto-scale so the model is roughly 1.7 three.js units tall
+      // (a comfortable human-scale size regardless of the source export
+      // scale), and recenter it on the ground at the origin.
+      const box = new THREE.Box3().setFromObject(currentModel);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      if (size.y > 0) {
+        const targetHeight = 1.7;
+        const scale = targetHeight / size.y;
+        currentModel.scale.setScalar(scale);
+      }
+      const box2 = new THREE.Box3().setFromObject(currentModel);
+      const center = new THREE.Vector3();
+      box2.getCenter(center);
+      currentModel.position.x -= center.x;
+      currentModel.position.z -= center.z;
+      currentModel.position.y -= box2.min.y; // sit on the grid
+
+      const allBoneNames = Object.keys(currentSkeletonBones);
+      const missing = Object.keys(BONE_MAP).filter((k) => !resolvedBones[k]);
       if (missing.length) {
-        statusEl.textContent =
-          "Loaded, but couldn't find these bones on the model (check names in BONE_MAP): " +
-          missing.join(", ");
+        statusEl.innerHTML =
+          "Couldn't find bones matching these expected suffixes: " + missing.map((k) => BONE_MAP[k]).join(", ") +
+          "<br>Actual bone names on this model: " +
+          allBoneNames.join(", ");
+        console.log("All bone names found on model:", allBoneNames);
       } else {
-        statusEl.textContent = `Model loaded (${Object.keys(currentSkeletonBones).length} bones found).`;
+        statusEl.textContent = `Model loaded (${allBoneNames.length} bones found, all ${Object.keys(BONE_MAP).length} mapped bones resolved).`;
       }
 
       slider.disabled = numFrames === 0;
@@ -196,11 +253,19 @@ loadBtn.addEventListener("click", () => {
   loadModel(url);
 });
 
+modelFileInput.addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const objectUrl = URL.createObjectURL(file);
+  modelUrlInput.value = ""; // clear so it's clear which source is active
+  loadModel(objectUrl);
+});
+
 // ---------- Retargeting ----------
-function applyRotation(mixamoName, rot, dampener = 1) {
-  const bone = currentSkeletonBones[mixamoName];
+function applyRotation(logicalKey, rot, dampener = 1) {
+  const bone = resolvedBones[logicalKey];
   if (!bone || !rot) return;
-  const flip = AXIS_FLIP[mixamoName] || AXIS_FLIP.default;
+  const flip = AXIS_FLIP[logicalKey] || AXIS_FLIP.default;
   const euler = new THREE.Euler(
     rot.x * dampener * flip.x,
     rot.y * dampener * flip.y,
@@ -215,25 +280,25 @@ function applyPose(riggedPose) {
   if (!riggedPose || !currentModel) return;
 
   if (hipsBone) {
-    applyRotation(BONE_MAP.Hips, riggedPose.Hips.rotation, 1);
+    applyRotation("Hips", riggedPose.Hips.rotation, 1);
     // Vertical bob from hip position delta, scaled down; horizontal
     // translation intentionally ignored to keep the model in place.
     hipsBone.position.y = initialHipsY + (riggedPose.Hips.position.y || 0) * 0.3;
   }
 
-  applyRotation(BONE_MAP.Spine, riggedPose.Spine, 0.6);
-  applyRotation(BONE_MAP.LeftUpperArm, riggedPose.LeftUpperArm);
-  applyRotation(BONE_MAP.LeftLowerArm, riggedPose.LeftLowerArm);
-  applyRotation(BONE_MAP.LeftHand, riggedPose.LeftHand);
-  applyRotation(BONE_MAP.RightUpperArm, riggedPose.RightUpperArm);
-  applyRotation(BONE_MAP.RightLowerArm, riggedPose.RightLowerArm);
-  applyRotation(BONE_MAP.RightHand, riggedPose.RightHand);
-  applyRotation(BONE_MAP.LeftUpperLeg, riggedPose.LeftUpperLeg);
-  applyRotation(BONE_MAP.LeftLowerLeg, riggedPose.LeftLowerLeg);
-  applyRotation(BONE_MAP.LeftFoot, riggedPose.LeftFoot);
-  applyRotation(BONE_MAP.RightUpperLeg, riggedPose.RightUpperLeg);
-  applyRotation(BONE_MAP.RightLowerLeg, riggedPose.RightLowerLeg);
-  applyRotation(BONE_MAP.RightFoot, riggedPose.RightFoot);
+  applyRotation("Spine", riggedPose.Spine, 0.6);
+  applyRotation("LeftUpperArm", riggedPose.LeftUpperArm);
+  applyRotation("LeftLowerArm", riggedPose.LeftLowerArm);
+  applyRotation("LeftHand", riggedPose.LeftHand);
+  applyRotation("RightUpperArm", riggedPose.RightUpperArm);
+  applyRotation("RightLowerArm", riggedPose.RightLowerArm);
+  applyRotation("RightHand", riggedPose.RightHand);
+  applyRotation("LeftUpperLeg", riggedPose.LeftUpperLeg);
+  applyRotation("LeftLowerLeg", riggedPose.LeftLowerLeg);
+  applyRotation("LeftFoot", riggedPose.LeftFoot);
+  applyRotation("RightUpperLeg", riggedPose.RightUpperLeg);
+  applyRotation("RightLowerLeg", riggedPose.RightLowerLeg);
+  applyRotation("RightFoot", riggedPose.RightFoot);
 }
 
 function toKalidokitLandmarks(arr) {
