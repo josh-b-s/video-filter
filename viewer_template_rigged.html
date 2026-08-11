@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Rigged 3D Motion Viewer</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/kalidokit@1.1.4/dist/kalidokit.umd.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #14171F; color: #e6e0fa; font-family: system-ui, sans-serif; overflow: hidden; }
+  #plot { width: 100vw; height: 76vh; }
+  #controls { height: 24vh; display: flex; flex-direction: column; justify-content: center; padding: 0 24px; box-sizing: border-box; gap: 10px; }
+  #row { display: flex; align-items: center; gap: 16px; }
+  button { background: #9b6fe0; border: none; color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:hover { background: #ad86e8; }
+  input[type=range] { flex: 1; }
+  input[type=text] { flex: 1; background: #1f2330; border: 1px solid #3a3f52; color: #e6e0fa; padding: 8px 10px; border-radius: 6px; font-size: 13px; }
+  #frameLabel { min-width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
+  #status { font-size: 12px; color: #9a93b8; min-height: 16px; }
+  label { font-size: 12px; color: #b8b2d4; }
+</style>
+</head>
+<body>
+  <div id="plot"></div>
+  <div id="controls">
+    <div id="row">
+      <label for="modelUrl">GLB URL</label>
+      <input type="text" id="modelUrl" placeholder="https://.../model.glb (Mixamo-rigged recommended)" />
+      <button id="loadBtn">Load model</button>
+    </div>
+    <div id="row">
+      <button id="playBtn" disabled>Play</button>
+      <input type="range" id="slider" min="0" value="0" step="1" disabled />
+      <span id="frameLabel">0 / 0</span>
+    </div>
+    <div id="status">Paste a Mixamo-rigged .glb URL above and click "Load model" to begin.</div>
+  </div>
+
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const DATA = __SKELETON_DATA__;
+const frames = DATA.frames;
+const fps = DATA.fps || 30;
+const numFrames = frames.length;
+
+const statusEl = document.getElementById("status");
+const slider = document.getElementById("slider");
+const frameLabel = document.getElementById("frameLabel");
+const playBtn = document.getElementById("playBtn");
+const loadBtn = document.getElementById("loadBtn");
+const modelUrlInput = document.getElementById("modelUrl");
+
+// ---------- Three.js scene ----------
+const container = document.getElementById("plot");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14171f);
+
+const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+camera.position.set(0, 1.4, 3.2);
+
+const renderer3d = new THREE.WebGLRenderer({ antialias: true });
+renderer3d.setSize(container.clientWidth, container.clientHeight);
+renderer3d.setPixelRatio(window.devicePixelRatio);
+container.appendChild(renderer3d.domElement);
+
+const controls = new OrbitControls(camera, renderer3d.domElement);
+controls.target.set(0, 1, 0);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 1.2));
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(2, 4, 2);
+scene.add(dirLight);
+
+const grid = new THREE.GridHelper(6, 24, 0x3a3f52, 0x24283a);
+scene.add(grid);
+
+window.addEventListener("resize", () => {
+  camera.aspect = container.clientWidth / container.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer3d.setSize(container.clientWidth, container.clientHeight);
+});
+
+function animateLoop() {
+  requestAnimationFrame(animateLoop);
+  controls.update();
+  renderer3d.render(scene, camera);
+}
+animateLoop();
+
+// ---------- Bone map: Kalidokit Pose.solve() output -> Mixamo rig ----------
+// Kalidokit's Pose solver returns rotations (radians, THREE.Euler-style
+// {x,y,z}) for these keys. Adjust the mixamorig names on the right if
+// your specific model uses different bone names (open it in a GLTF
+// inspector, e.g. https://gltf-viewer.donmccurdy.com, to check).
+const BONE_MAP = {
+  Hips: "mixamorigHips",
+  Spine: "mixamorigSpine",
+  LeftUpperArm: "mixamorigLeftArm",
+  LeftLowerArm: "mixamorigLeftForeArm",
+  LeftHand: "mixamorigLeftHand",
+  RightUpperArm: "mixamorigRightArm",
+  RightLowerArm: "mixamorigRightForeArm",
+  RightHand: "mixamorigRightHand",
+  LeftUpperLeg: "mixamorigLeftUpLeg",
+  LeftLowerLeg: "mixamorigLeftLeg",
+  LeftFoot: "mixamorigLeftFoot",
+  RightUpperLeg: "mixamorigRightUpLeg",
+  RightLowerLeg: "mixamorigRightLeg",
+  RightFoot: "mixamorigRightFoot",
+};
+
+// Per-bone axis sign flips. Mixamo rigs are fairly consistent, but if a
+// limb rotates the wrong way on your model, flip the corresponding sign
+// here rather than anywhere else.
+const AXIS_FLIP = {
+  default: { x: 1, y: 1, z: 1 },
+  LeftUpperArm: { x: 1, y: 1, z: -1 },
+  LeftLowerArm: { x: 1, y: 1, z: -1 },
+  RightUpperArm: { x: 1, y: 1, z: -1 },
+  RightLowerArm: { x: 1, y: 1, z: -1 },
+};
+
+let currentModel = null;
+let currentSkeletonBones = {}; // mixamo name -> THREE.Bone
+let hipsBone = null;
+let initialHipsY = 0;
+
+function collectBones(root) {
+  const map = {};
+  root.traverse((obj) => {
+    if (obj.isBone) map[obj.name] = obj;
+  });
+  return map;
+}
+
+function clearModel() {
+  if (currentModel) {
+    scene.remove(currentModel);
+    currentModel = null;
+    currentSkeletonBones = {};
+    hipsBone = null;
+  }
+}
+
+function loadModel(url) {
+  statusEl.textContent = "Loading model...";
+  const loader = new GLTFLoader();
+  loader.load(
+    url,
+    (gltf) => {
+      clearModel();
+      currentModel = gltf.scene;
+      scene.add(currentModel);
+      currentSkeletonBones = collectBones(currentModel);
+      hipsBone = currentSkeletonBones[BONE_MAP.Hips] || null;
+      initialHipsY = hipsBone ? hipsBone.position.y : 0;
+
+      const missing = Object.values(BONE_MAP).filter((n) => !currentSkeletonBones[n]);
+      if (missing.length) {
+        statusEl.textContent =
+          "Loaded, but couldn't find these bones on the model (check names in BONE_MAP): " +
+          missing.join(", ");
+      } else {
+        statusEl.textContent = `Model loaded (${Object.keys(currentSkeletonBones).length} bones found).`;
+      }
+
+      slider.disabled = numFrames === 0;
+      playBtn.disabled = numFrames === 0;
+      slider.max = Math.max(0, numFrames - 1);
+      showFrame(0);
+    },
+    undefined,
+    (err) => {
+      statusEl.textContent = "Failed to load model: " + err.message;
+      console.error(err);
+    }
+  );
+}
+
+loadBtn.addEventListener("click", () => {
+  const url = modelUrlInput.value.trim();
+  if (!url) {
+    statusEl.textContent = "Enter a .glb URL first.";
+    return;
+  }
+  loadModel(url);
+});
+
+// ---------- Retargeting ----------
+function applyRotation(mixamoName, rot, dampener = 1) {
+  const bone = currentSkeletonBones[mixamoName];
+  if (!bone || !rot) return;
+  const flip = AXIS_FLIP[mixamoName] || AXIS_FLIP.default;
+  const euler = new THREE.Euler(
+    rot.x * dampener * flip.x,
+    rot.y * dampener * flip.y,
+    rot.z * dampener * flip.z,
+    "XYZ"
+  );
+  const targetQuat = new THREE.Quaternion().setFromEuler(euler);
+  bone.quaternion.slerp(targetQuat, 0.6); // light smoothing between frames
+}
+
+function applyPose(riggedPose) {
+  if (!riggedPose || !currentModel) return;
+
+  if (hipsBone) {
+    applyRotation(BONE_MAP.Hips, riggedPose.Hips.rotation, 1);
+    // Vertical bob from hip position delta, scaled down; horizontal
+    // translation intentionally ignored to keep the model in place.
+    hipsBone.position.y = initialHipsY + (riggedPose.Hips.position.y || 0) * 0.3;
+  }
+
+  applyRotation(BONE_MAP.Spine, riggedPose.Spine, 0.6);
+  applyRotation(BONE_MAP.LeftUpperArm, riggedPose.LeftUpperArm);
+  applyRotation(BONE_MAP.LeftLowerArm, riggedPose.LeftLowerArm);
+  applyRotation(BONE_MAP.LeftHand, riggedPose.LeftHand);
+  applyRotation(BONE_MAP.RightUpperArm, riggedPose.RightUpperArm);
+  applyRotation(BONE_MAP.RightLowerArm, riggedPose.RightLowerArm);
+  applyRotation(BONE_MAP.RightHand, riggedPose.RightHand);
+  applyRotation(BONE_MAP.LeftUpperLeg, riggedPose.LeftUpperLeg);
+  applyRotation(BONE_MAP.LeftLowerLeg, riggedPose.LeftLowerLeg);
+  applyRotation(BONE_MAP.LeftFoot, riggedPose.LeftFoot);
+  applyRotation(BONE_MAP.RightUpperLeg, riggedPose.RightUpperLeg);
+  applyRotation(BONE_MAP.RightLowerLeg, riggedPose.RightLowerLeg);
+  applyRotation(BONE_MAP.RightFoot, riggedPose.RightFoot);
+}
+
+function toKalidokitLandmarks(arr) {
+  // arr entries are [x, y, z, visibility]
+  return arr.map(([x, y, z, visibility]) => ({ x, y, z, visibility }));
+}
+
+function showFrame(i) {
+  const entry = frames[i];
+  frameLabel.textContent = `${i} / ${Math.max(0, numFrames - 1)}`;
+  if (!entry || !entry.landmarks || !entry.worldLandmarks || !currentModel) return;
+
+  const landmarks = toKalidokitLandmarks(entry.landmarks);
+  const worldLandmarks = toKalidokitLandmarks(entry.worldLandmarks);
+
+  const riggedPose = Kalidokit.Pose.solve(worldLandmarks, landmarks, {
+    runtime: "mediapipe",
+    enableLegs: true,
+  });
+
+  applyPose(riggedPose);
+}
+
+slider.addEventListener("input", () => showFrame(parseInt(slider.value, 10)));
+
+let playing = false;
+let playTimer = null;
+playBtn.addEventListener("click", () => {
+  playing = !playing;
+  playBtn.textContent = playing ? "Pause" : "Play";
+  if (playing) {
+    const intervalMs = 1000 / fps;
+    playTimer = setInterval(() => {
+      let next = parseInt(slider.value, 10) + 1;
+      if (next > numFrames - 1) next = 0;
+      slider.value = next;
+      showFrame(next);
+    }, intervalMs);
+  } else {
+    clearInterval(playTimer);
+  }
+});
+</script>
+</body>
+</html>

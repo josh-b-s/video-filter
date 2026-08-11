@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>3D Skeleton Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.32.0/plotly.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #14171F; color: #e6e0fa; font-family: system-ui, sans-serif; }
+  #plot { width: 100vw; height: 82vh; }
+  #controls { height: 18vh; display: flex; flex-direction: column; justify-content: center; padding: 0 24px; box-sizing: border-box; gap: 10px; }
+  #row { display: flex; align-items: center; gap: 16px; }
+  button { background: #9b6fe0; border: none; color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:hover { background: #ad86e8; }
+  input[type=range] { flex: 1; }
+  #frameLabel { min-width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <div id="plot"></div>
+  <div id="controls">
+    <div id="row">
+      <button id="playBtn">Play</button>
+      <input type="range" id="slider" min="0" value="0" step="1" />
+      <span id="frameLabel">0 / 0</span>
+    </div>
+  </div>
+
+<script>
+const DATA = __SKELETON_DATA__;
+const frames = DATA.frames;
+const bones = DATA.bones;
+const numFrames = frames.length;
+
+const lineColor = "rgb(155,111,224)";
+const jointColor = "rgb(230,220,250)";
+const bgColor = "#14171F";
+
+function frameToTraces(points) {
+  const boneTraces = [];
+  const allBones = [...bones];
+  if (points["neck"] && points["head"]) {
+    allBones.push(["neck", "head"]);
+  }
+  for (const [a, b] of allBones) {
+    const pa = points[String(a)];
+    const pb = points[String(b)];
+    if (!pa || !pb) continue;
+    boneTraces.push({
+      type: "scatter3d",
+      mode: "lines",
+      x: [pa[0], pb[0]], y: [pa[1], pb[1]], z: [pa[2], pb[2]],
+      line: { color: lineColor, width: 8 },
+      hoverinfo: "skip",
+      showlegend: false,
+    });
+  }
+
+  const jx = [], jy = [], jz = [], jsize = [];
+  for (const [k, v] of Object.entries(points)) {
+    jx.push(v[0]); jy.push(v[1]); jz.push(v[2]);
+    jsize.push(k === "head" ? 16 : 6);
+  }
+  const jointTrace = {
+    type: "scatter3d",
+    mode: "markers",
+    x: jx, y: jy, z: jz,
+    marker: { color: jointColor, size: jsize },
+    hoverinfo: "skip",
+    showlegend: false,
+  };
+
+  return [...boneTraces, jointTrace];
+}
+
+const layout = {
+  paper_bgcolor: bgColor,
+  scene: {
+    bgcolor: bgColor,
+    xaxis: { range: [-2.2, 2.2], visible: false },
+    yaxis: { range: [-2.2, 2.2], visible: false },
+    zaxis: { range: [-2.2, 2.2], visible: false },
+    aspectmode: "cube",
+    camera: { eye: { x: 1.4, y: 1.4, z: 0.8 } },
+  },
+  margin: { l: 0, r: 0, t: 0, b: 0 },
+  uirevision: "keep", // preserve camera angle across frame changes
+};
+
+const plotDiv = document.getElementById("plot");
+Plotly.newPlot(plotDiv, frameToTraces(frames[0] || {}), layout, { displaylogo: false });
+
+const slider = document.getElementById("slider");
+const frameLabel = document.getElementById("frameLabel");
+const playBtn = document.getElementById("playBtn");
+slider.max = Math.max(0, numFrames - 1);
+
+function showFrame(i) {
+  Plotly.react(plotDiv, frameToTraces(frames[i] || {}), layout, { displaylogo: false });
+  frameLabel.textContent = `${i} / ${numFrames - 1}`;
+}
+showFrame(0);
+
+slider.addEventListener("input", () => showFrame(parseInt(slider.value, 10)));
+
+let playing = false;
+let playTimer = null;
+playBtn.addEventListener("click", () => {
+  playing = !playing;
+  playBtn.textContent = playing ? "Pause" : "Play";
+  if (playing) {
+    playTimer = setInterval(() => {
+      let next = parseInt(slider.value, 10) + 1;
+      if (next > numFrames - 1) next = 0;
+      slider.value = next;
+      showFrame(next);
+    }, 33);
+  } else {
+    clearInterval(playTimer);
+  }
+});
+</script>
+</body>
+</html>
