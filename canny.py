@@ -16,12 +16,12 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ============================================================
 
-input_video_path = "materials/videos/ikun.mp4"
+input_video_path = "materials/videos/test.mp4"
 output_folder = "output"
 
 # Preset 3 = balanced
-bg_color_rgb = [237, 244, 247]
-line_color_rgb = [155, 111, 224]
+bg_color_rgb = [20, 23, 31]       # #14171F
+line_color_rgb = [155, 111, 224]  # mobility purple
 
 use_clahe = True
 clahe_clip_limit = 1.5
