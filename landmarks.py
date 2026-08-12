@@ -74,3 +74,21 @@ def add_synthetic_head(points: dict) -> None:
     head = (neck[0], neck[1], neck[2] + HEAD_OFFSET_UP)
     points["neck"] = neck
     points["head"] = head
+
+
+def extract_raw_points(result) -> dict[int, tuple[float, float, float, float]]:
+    """All 33 landmarks' (x, y, z, visibility) in scene coordinates, with
+    NO visibility filtering and NO smoothing applied. Purely for
+    debugging/comparing against the processed, filtered figure -- lets
+    you see exactly what MediaPipe reported for a frame before any of
+    this project's cleanup touches it."""
+    points: dict[int, tuple[float, float, float, float]] = {}
+    if not result.pose_world_landmarks:
+        return points
+
+    frame_landmarks = result.pose_world_landmarks[0]
+    for idx, lm in enumerate(frame_landmarks):
+        x, y, z = to_scene_coords(lm)
+        visibility = getattr(lm, "visibility", 1.0)
+        points[idx] = (x, y, z, float(visibility) if visibility is not None else 1.0)
+    return points

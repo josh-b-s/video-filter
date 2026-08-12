@@ -37,7 +37,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def extract_frames(input_path: str) -> list[dict]:
+def extract_frames(input_path: str) -> tuple[list[dict], list[dict]]:
     make_sure_file_exists(input_path)
 
     video = cv.VideoCapture(input_path)
@@ -51,6 +51,7 @@ def extract_frames(input_path: str) -> list[dict]:
     detector = PoseDetector(fps)
     smoother = LandmarkSmoother()
     frames_out = []
+    raw_frames_out = []
 
     progress = tqdm(total=total_frames, desc="Extracting 3D landmarks...")
     while True:
@@ -59,33 +60,37 @@ def extract_frames(input_path: str) -> list[dict]:
             break
 
         result = detector.detect(frame)
+
         points = landmarks.extract_points(result, ACTIVE_LANDMARKS, smoother)
         if not SHOW_ALL_LANDMARKS:
             landmarks.add_synthetic_head(points)
-
-        # JSON needs string keys; landmark indices become strings, plus
-        # the synthetic "neck"/"head" keys already are strings.
         frames_out.append({str(k): list(v) for k, v in points.items()})
+
+        raw_points = landmarks.extract_raw_points(result)
+        raw_frames_out.append({str(k): list(v) for k, v in raw_points.items()})
+
         progress.update(1)
 
     progress.close()
     detector.close()
     video.release()
-    return frames_out
+    return frames_out, raw_frames_out
 
 
-def build_payload(frames: list[dict]) -> dict:
+def build_payload(frames: list[dict], raw_frames: list[dict]) -> dict:
     return {
         "frames": frames,
         "bones": ACTIVE_CONNECTIONS,
         "hasHead": not SHOW_ALL_LANDMARKS,
+        "rawFrames": raw_frames,
+        "rawBones": landmarks.ALL_CONNECTIONS,
     }
 
 
 if __name__ == "__main__":
     os.makedirs(config.output_folder, exist_ok=True)
-    frames = extract_frames(config.input_video_path)
+    frames, raw_frames = extract_frames(config.input_video_path)
     filename_noext = Path(config.input_video_path).stem
     out_path = os.path.join(config.output_folder, f"{filename_noext}-[skeleton-3d-viewer].html")
     template_path = os.path.join(os.path.dirname(__file__), "viewer_template.html")
-    write_viewer_html(build_payload(frames), template_path, out_path)
+    write_viewer_html(build_payload(frames, raw_frames), template_path, out_path)

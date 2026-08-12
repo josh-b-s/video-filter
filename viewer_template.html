@@ -40,6 +40,11 @@
         <option value="0.5">2x</option>
         <option value="0.25">4x</option>
       </select>
+      <label for="viewMode" style="font-size:12px;color:#b8b2d4;">View</label>
+      <select id="viewMode">
+        <option value="volumetric" selected>Volumetric figure</option>
+        <option value="raw">Raw joints (unfiltered)</option>
+      </select>
     </div>
     <div id="row">
       <div id="legend">
@@ -47,6 +52,7 @@
         <span><span class="swatch" style="background:#5cc8ff"></span>Left side</span>
         <span><span class="swatch" style="background:#c9c0e8"></span>Center / torso</span>
       </div>
+      <span id="rawNote" style="display:none;font-size:12px;color:#b8b2d4;">Raw view: dimmer = lower MediaPipe visibility confidence. No smoothing, no filtering, no grounding.</span>
     </div>
   </div>
 
@@ -152,11 +158,14 @@ const cylinderGeom = new THREE.CylinderGeometry(1, 1, 1, 14, 1);
 const sphereGeom = new THREE.SphereGeometry(1, 18, 14);
 const torsoGeom = new RoundedBoxGeometry(1, 1, 1, 4, 0.18);
 
+const volumetricGroup = new THREE.Group();
+scene.add(volumetricGroup);
+
 const limbMeshes = {};
 for (const seg of LIMB_SEGMENTS) {
   const mesh = new THREE.Mesh(cylinderGeom, matForSide(seg.side));
   mesh.visible = false;
-  scene.add(mesh);
+  volumetricGroup.add(mesh);
   limbMeshes[seg.name] = mesh;
 }
 
@@ -164,21 +173,48 @@ const jointMeshes = {};
 for (const j of JOINT_SPHERES) {
   const mesh = new THREE.Mesh(sphereGeom, matForSide(j.side));
   mesh.visible = false;
-  scene.add(mesh);
+  volumetricGroup.add(mesh);
   jointMeshes[j.idx] = mesh;
 }
 
 const neckMesh = new THREE.Mesh(cylinderGeom, matCenter);
 neckMesh.visible = false;
-scene.add(neckMesh);
+volumetricGroup.add(neckMesh);
 
 const headMesh = new THREE.Mesh(sphereGeom, matCenter);
 headMesh.visible = false;
-scene.add(headMesh);
+volumetricGroup.add(headMesh);
 
 const torsoMesh = new THREE.Mesh(torsoGeom, matCenter);
 torsoMesh.visible = false;
-scene.add(torsoMesh);
+volumetricGroup.add(torsoMesh);
+
+// ---------- Raw (unfiltered, unsmoothed) debug view ----------
+// Straight from MediaPipe: all 33 landmarks, no visibility filtering,
+// no smoothing, no floor-snap grounding -- just the axis swap and the
+// same fixed X/Z centering as the volumetric view, so the two can be
+// visually compared in the same spot. Dimmer points = lower MediaPipe
+// visibility confidence for that landmark that frame.
+const rawFrames = DATA.rawFrames || [];
+const rawBones = DATA.rawBones || [];
+const RAW_MAX_JOINTS = 33;
+
+const rawGroup = new THREE.Group();
+rawGroup.visible = false;
+scene.add(rawGroup);
+
+const rawPointsGeom = new THREE.BufferGeometry();
+rawPointsGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(RAW_MAX_JOINTS * 3), 3));
+rawPointsGeom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(RAW_MAX_JOINTS * 3), 3));
+const rawPointsMat = new THREE.PointsMaterial({ size: 0.045, vertexColors: true, sizeAttenuation: true });
+const rawPoints = new THREE.Points(rawPointsGeom, rawPointsMat);
+rawGroup.add(rawPoints);
+
+const rawLinesGeom = new THREE.BufferGeometry();
+rawLinesGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(rawBones.length * 2 * 3), 3));
+const rawLinesMat = new THREE.LineBasicMaterial({ color: CENTER_COLOR, transparent: true, opacity: 0.6 });
+const rawLines = new THREE.LineSegments(rawLinesGeom, rawLinesMat);
+rawGroup.add(rawLines);
 
 // ---------- Per-frame transform helpers ----------
 const UP = new THREE.Vector3(0, 1, 0);
@@ -327,9 +363,22 @@ function showFrame(i) {
   }
 
   // Head position: prefer the synthetic "head" point (present when the
-  // exporter's SHOW_ALL_LANDMARKS is False), else fall back to the nose
-  // landmark (index 0), which is present when it's True.
-  const headPos = pointOf(points, "head") || pointOf(points, "0");
+  // exporter's SHOW_ALL_LANDMARKS is False). Otherwise, prefer the
+  // midpoint between the ears (7, 8) over the nose (0) -- the nose
+  // sits well forward of the skull's actual center, so anchoring the
+  // head sphere there was tilting the neck/head noticeably forward.
+  // Ears sit much closer to the true center, front-to-back. Falls back
+  // to nose only if neither ear was detected/visible this frame.
+  const leftEar = pointOf(points, "7");
+  const rightEar = pointOf(points, "8");
+  let headPos = pointOf(points, "head");
+  if (!headPos) {
+    if (leftEar && rightEar) {
+      headPos = leftEar.clone().add(rightEar).multiplyScalar(0.5);
+    } else {
+      headPos = leftEar || rightEar || pointOf(points, "0");
+    }
+  }
   const neckBase = pointOf(points, "neck") || shoulderMid;
 
   if (headPos) {
@@ -342,6 +391,56 @@ function showFrame(i) {
   } else {
     neckMesh.visible = false;
   }
+
+  updateRawView(i);
+}
+
+// Colors a raw joint by MediaPipe visibility confidence: dim gray at
+// low confidence, full center-color at high confidence. Purely a
+// debug/comparison view, so no side coloring, no grounding, no offset
+// beyond the same fixed X/Z centering used by the volumetric figure.
+const RAW_DIM = new THREE.Color(0x3a3f52);
+const RAW_BRIGHT = new THREE.Color(CENTER_COLOR);
+const _rawColor = new THREE.Color();
+
+function updateRawView(i) {
+  const raw = rawFrames[i] || {};
+  const posAttr = rawPointsGeom.getAttribute("position");
+  const colorAttr = rawPointsGeom.getAttribute("color");
+
+  for (let idx = 0; idx < RAW_MAX_JOINTS; idx++) {
+    const v = raw[String(idx)];
+    if (!v) {
+      // Park unused points far away rather than leaving stale data visible.
+      posAttr.setXYZ(idx, 0, -9999, 0);
+      colorAttr.setXYZ(idx, 0, 0, 0);
+      continue;
+    }
+    const x = v[0] + CENTER_XZ.x;
+    const y = v[2]; // no floor-snap in the raw view -- shows real estimated height
+    const z = v[1] + CENTER_XZ.z;
+    posAttr.setXYZ(idx, x, y, z);
+    const visibility = v[3] != null ? Math.max(0, Math.min(1, v[3])) : 1;
+    _rawColor.copy(RAW_DIM).lerp(RAW_BRIGHT, visibility);
+    colorAttr.setXYZ(idx, _rawColor.r, _rawColor.g, _rawColor.b);
+  }
+  posAttr.needsUpdate = true;
+  colorAttr.needsUpdate = true;
+
+  const linePosAttr = rawLinesGeom.getAttribute("position");
+  let vi = 0;
+  for (const [a, b] of rawBones) {
+    const pa = raw[String(a)];
+    const pb = raw[String(b)];
+    if (pa && pb) {
+      linePosAttr.setXYZ(vi++, pa[0] + CENTER_XZ.x, pa[2], pa[1] + CENTER_XZ.z);
+      linePosAttr.setXYZ(vi++, pb[0] + CENTER_XZ.x, pb[2], pb[1] + CENTER_XZ.z);
+    } else {
+      linePosAttr.setXYZ(vi++, 0, -9999, 0);
+      linePosAttr.setXYZ(vi++, 0, -9999, 0);
+    }
+  }
+  linePosAttr.needsUpdate = true;
 }
 
 // ---------- Controls ----------
@@ -349,7 +448,16 @@ const slider = document.getElementById("slider");
 const frameLabel = document.getElementById("frameLabel");
 const playBtn = document.getElementById("playBtn");
 const speedSelect = document.getElementById("speed");
+const viewModeSelect = document.getElementById("viewMode");
+const rawNote = document.getElementById("rawNote");
 slider.max = Math.max(0, numFrames - 1);
+
+viewModeSelect.addEventListener("change", () => {
+  const isRaw = viewModeSelect.value === "raw";
+  volumetricGroup.visible = !isRaw;
+  rawGroup.visible = isRaw;
+  rawNote.style.display = isRaw ? "inline" : "none";
+});
 
 showFrame(0);
 slider.addEventListener("input", () => showFrame(parseInt(slider.value, 10)));
