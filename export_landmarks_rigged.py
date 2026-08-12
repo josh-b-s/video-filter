@@ -14,11 +14,10 @@ correctly.
 Usage:
     python export_landmarks_rigged.py
 
-Reads:  input_video_path (from pose_skeleton.py config)
+Reads:  config.input_video_path
 Writes: output/<video-name>-[rigged-3d-viewer].html
 """
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -26,12 +25,10 @@ from pathlib import Path
 import cv2 as cv
 from tqdm import tqdm
 
-from pose_skeleton import (
-    SkeletonRenderer3D,
-    input_video_path,
-    make_sure_file_exists,
-    output_folder,
-)
+import config
+from pose_detector import PoseDetector
+from utils import make_sure_file_exists
+from viewer_writer import write_viewer_html
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,16 +50,8 @@ def extract_frames(input_path: str) -> tuple[list[dict], float]:
     total_frames = int(video.get(cv.CAP_PROP_FRAME_COUNT))
     logger.info(f"fps: {fps}; total_frames: {total_frames}")
 
-    # Reuse SkeletonRenderer3D purely to get an already-configured
-    # landmarker + correct timestamp cadence; we bypass its smoothing.
-    renderer = SkeletonRenderer3D(fps)
-    frame_duration_ms = renderer._frame_duration_ms
-    landmarker = renderer.landmarker
-
-    from mediapipe import Image, ImageFormat
-
+    detector = PoseDetector(fps)
     frames_out = []
-    frame_index = 0
 
     progress = tqdm(total=total_frames, desc="Extracting raw landmarks...")
     while True:
@@ -70,13 +59,7 @@ def extract_frames(input_path: str) -> tuple[list[dict], float]:
         if not success:
             break
 
-        rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-        mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
-
-        timestamp_ms = int(frame_index * frame_duration_ms)
-        frame_index += 1
-
-        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        result = detector.detect(frame)
 
         entry = {"landmarks": None, "worldLandmarks": None}
         if result.pose_landmarks:
@@ -90,29 +73,15 @@ def extract_frames(input_path: str) -> tuple[list[dict], float]:
         progress.update(1)
 
     progress.close()
-    renderer.close()
+    detector.close()
     video.release()
     return frames_out, fps
 
 
-def build_html(frames: list[dict], fps: float, out_path: str) -> None:
-    payload = {"frames": frames, "fps": fps}
-
-    template_path = os.path.join(os.path.dirname(__file__), "viewer_template_rigged.html")
-    with open(template_path, "r") as f:
-        template = f.read()
-
-    html = template.replace("__SKELETON_DATA__", json.dumps(payload))
-
-    with open(out_path, "w") as f:
-        f.write(html)
-
-    logger.info(f"Viewer written to: {out_path}")
-
-
 if __name__ == "__main__":
-    os.makedirs(output_folder, exist_ok=True)
-    frames, fps = extract_frames(input_video_path)
-    filename_noext = Path(input_video_path).stem
-    out_path = os.path.join(output_folder, f"{filename_noext}-[rigged-3d-viewer].html")
-    build_html(frames, fps, out_path)
+    os.makedirs(config.output_folder, exist_ok=True)
+    frames, fps = extract_frames(config.input_video_path)
+    filename_noext = Path(config.input_video_path).stem
+    out_path = os.path.join(config.output_folder, f"{filename_noext}-[rigged-3d-viewer].html")
+    template_path = os.path.join(os.path.dirname(__file__), "viewer_template_rigged.html")
+    write_viewer_html({"frames": frames, "fps": fps}, template_path, out_path)

@@ -1,17 +1,15 @@
 """
-Exports the same 3D world-landmark points that pose_skeleton.py renders,
-but instead of baking them into fixed-camera matplotlib videos, dumps them
-into a single self-contained HTML file you can open in any browser and
-freely rotate / zoom / scrub through frames (via Plotly.js).
+Exports 3D world-landmark points into a single self-contained HTML file
+(viewer_template.html) you can open in any browser and freely rotate /
+zoom / scrub through frames, rendered as a volumetric 3D stick figure.
 
 Usage:
     python export_landmarks.py
 
-Reads:  input_video_path (from pose_skeleton.py config)
+Reads:  config.input_video_path
 Writes: output/<video-name>-[skeleton-3d-viewer].html
 """
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -19,59 +17,24 @@ from pathlib import Path
 import cv2 as cv
 from tqdm import tqdm
 
-from mediapipe.tasks.python.vision import PoseLandmarksConnections
-
-from pose_skeleton import (
-    BONE_CONNECTIONS,
-    SkeletonRenderer3D,
-    input_video_path,
-    make_sure_file_exists,
-    min_landmark_visibility,
-    output_folder,
-)
+import config
+import landmarks
+from landmark_smoothing import LandmarkSmoother
+from pose_detector import PoseDetector
+from utils import make_sure_file_exists
+from viewer_writer import write_viewer_html
 
 # Set to True to include ALL 33 landmarks (including the face: nose,
-# eyes, ears, mouth) instead of the face-stripped set used by
-# pose_skeleton.py. Only meant for your own local viewing.
+# eyes, ears, mouth) instead of the face-stripped set. Only meant for
+# your own local viewing -- the volumetric viewer ignores individual
+# face points either way and just uses the nose as a head anchor.
 SHOW_ALL_LANDMARKS = True
 
-ALL_CONNECTIONS = [
-    (c.start, c.end) for c in PoseLandmarksConnections.POSE_LANDMARKS
-]
-ALL_LANDMARKS = sorted({i for pair in ALL_CONNECTIONS for i in pair})
-
-ACTIVE_CONNECTIONS = ALL_CONNECTIONS if SHOW_ALL_LANDMARKS else BONE_CONNECTIONS
-ACTIVE_LANDMARKS = ALL_LANDMARKS if SHOW_ALL_LANDMARKS else None
+ACTIVE_LANDMARKS = landmarks.ALL_LANDMARKS if SHOW_ALL_LANDMARKS else landmarks.BODY_LANDMARKS
+ACTIVE_CONNECTIONS = landmarks.ALL_CONNECTIONS if SHOW_ALL_LANDMARKS else landmarks.BODY_CONNECTIONS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-
-def compute_all_points(renderer: SkeletonRenderer3D, frame) -> dict:
-    """Like SkeletonRenderer3D._compute_points, but keeps every landmark
-    in ACTIVE_LANDMARKS instead of the face-stripped BODY_LANDMARKS."""
-    rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-    from mediapipe import Image, ImageFormat
-    mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
-
-    timestamp_ms = int(renderer._frame_index * renderer._frame_duration_ms)
-    renderer._frame_index += 1
-
-    result = renderer.landmarker.detect_for_video(mp_image, timestamp_ms)
-
-    points: dict = {}
-    if not result.pose_world_landmarks:
-        return points
-
-    landmarks = result.pose_world_landmarks[0]
-    for idx in ACTIVE_LANDMARKS:
-        lm = landmarks[idx]
-        visibility = getattr(lm, "visibility", 1.0)
-        if visibility is not None and visibility < min_landmark_visibility:
-            continue
-        points[idx] = renderer._smooth_point(idx, lm.x, -lm.z, -lm.y)
-
-    return points
 
 
 def extract_frames(input_path: str) -> list[dict]:
@@ -85,7 +48,8 @@ def extract_frames(input_path: str) -> list[dict]:
     total_frames = int(video.get(cv.CAP_PROP_FRAME_COUNT))
     logger.info(f"fps: {fps}; total_frames: {total_frames}")
 
-    renderer = SkeletonRenderer3D(fps)
+    detector = PoseDetector(fps)
+    smoother = LandmarkSmoother()
     frames_out = []
 
     progress = tqdm(total=total_frames, desc="Extracting 3D landmarks...")
@@ -94,45 +58,34 @@ def extract_frames(input_path: str) -> list[dict]:
         if not success:
             break
 
-        points = (
-            compute_all_points(renderer, frame)
-            if SHOW_ALL_LANDMARKS
-            else renderer._compute_points(frame)
-        )
+        result = detector.detect(frame)
+        points = landmarks.extract_points(result, ACTIVE_LANDMARKS, smoother)
+        if not SHOW_ALL_LANDMARKS:
+            landmarks.add_synthetic_head(points)
+
         # JSON needs string keys; landmark indices become strings, plus
         # the synthetic "neck"/"head" keys already are strings.
         frames_out.append({str(k): list(v) for k, v in points.items()})
-
         progress.update(1)
 
     progress.close()
-    renderer.close()
+    detector.close()
     video.release()
     return frames_out
 
 
-def build_html(frames: list[dict], out_path: str) -> None:
-    payload = {
+def build_payload(frames: list[dict]) -> dict:
+    return {
         "frames": frames,
         "bones": ACTIVE_CONNECTIONS,
         "hasHead": not SHOW_ALL_LANDMARKS,
     }
 
-    template_path = os.path.join(os.path.dirname(__file__), "viewer_template.html")
-    with open(template_path, "r") as f:
-        template = f.read()
-
-    html = template.replace("__SKELETON_DATA__", json.dumps(payload))
-
-    with open(out_path, "w") as f:
-        f.write(html)
-
-    logger.info(f"Viewer written to: {out_path}")
-
 
 if __name__ == "__main__":
-    os.makedirs(output_folder, exist_ok=True)
-    frames = extract_frames(input_video_path)
-    filename_noext = Path(input_video_path).stem
-    out_path = os.path.join(output_folder, f"{filename_noext}-[skeleton-3d-viewer].html")
-    build_html(frames, out_path)
+    os.makedirs(config.output_folder, exist_ok=True)
+    frames = extract_frames(config.input_video_path)
+    filename_noext = Path(config.input_video_path).stem
+    out_path = os.path.join(config.output_folder, f"{filename_noext}-[skeleton-3d-viewer].html")
+    template_path = os.path.join(os.path.dirname(__file__), "viewer_template.html")
+    write_viewer_html(build_payload(frames), template_path, out_path)

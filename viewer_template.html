@@ -3,9 +3,16 @@
 <head>
 <meta charset="UTF-8" />
 <title>3D Skeleton Viewer</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.32.0/plotly.min.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
 <style>
-  html, body { margin: 0; height: 100%; background: #14171F; color: #e6e0fa; font-family: system-ui, sans-serif; }
+  html, body { margin: 0; height: 100%; background: #14171F; color: #e6e0fa; font-family: system-ui, sans-serif; overflow: hidden; }
   #plot { width: 100vw; height: 82vh; }
   #controls { height: 18vh; display: flex; flex-direction: column; justify-content: center; padding: 0 24px; box-sizing: border-box; gap: 10px; }
   #row { display: flex; align-items: center; gap: 16px; }
@@ -38,118 +45,313 @@
       <div id="legend">
         <span><span class="swatch" style="background:#ff6a5c"></span>Right side</span>
         <span><span class="swatch" style="background:#5cc8ff"></span>Left side</span>
-        <span><span class="swatch" style="background:#e6e0fa"></span>Center / torso</span>
+        <span><span class="swatch" style="background:#c9c0e8"></span>Center / torso</span>
       </div>
     </div>
   </div>
 
-<script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
+
 const DATA = __SKELETON_DATA__;
 const frames = DATA.frames;
-const bones = DATA.bones;
 const numFrames = frames.length;
 
-const RIGHT_COLOR = "rgb(255,106,92)";  // warm red -- viewer's... the subject's right side
-const LEFT_COLOR = "rgb(92,200,255)";   // cool blue -- subject's left side
-const CENTER_COLOR = "rgb(230,220,250)";
-const bgColor = "#14171F";
+const RIGHT_COLOR = 0xff6a5c;
+const LEFT_COLOR = 0x5cc8ff;
+const CENTER_COLOR = 0xc9c0e8;
+const bgColor = 0x14171f;
 
-// MediaPipe pose landmark indices: odd = subject's left, even = subject's
-// right (0 = nose, treated as center). "neck"/"head" synthetic keys are
-// center. This lets bones/joints be colored by side without any extra
-// metadata from the Python export.
-function sideOf(key) {
-  if (key === "head" || key === "neck") return "center";
-  const n = parseInt(key, 10);
-  if (Number.isNaN(n) || n === 0) return "center";
-  return n % 2 === 1 ? "left" : "right";
+// ---------- Three.js scene ----------
+const container = document.getElementById("plot");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(bgColor);
+
+const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.05, 50);
+camera.position.set(1.8, 1.3, 2.4);
+
+const renderer3d = new THREE.WebGLRenderer({ antialias: true });
+renderer3d.setSize(container.clientWidth, container.clientHeight);
+renderer3d.setPixelRatio(window.devicePixelRatio);
+container.appendChild(renderer3d.domElement);
+
+const controls = new OrbitControls(camera, renderer3d.domElement);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x33334d, 1.3));
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.1);
+dirLight.position.set(2, 4, 2);
+scene.add(dirLight);
+const fillLight = new THREE.DirectionalLight(0xffffff, 0.35);
+fillLight.position.set(-2, 1, -2);
+scene.add(fillLight);
+
+const grid = new THREE.GridHelper(4, 16, 0x3a3f52, 0x24283a);
+scene.add(grid);
+
+window.addEventListener("resize", () => {
+  camera.aspect = container.clientWidth / container.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer3d.setSize(container.clientWidth, container.clientHeight);
+});
+
+function animateLoop() {
+  requestAnimationFrame(animateLoop);
+  controls.update();
+  renderer3d.render(scene, camera);
 }
-function colorForSide(side) {
-  if (side === "left") return LEFT_COLOR;
-  if (side === "right") return RIGHT_COLOR;
-  return CENTER_COLOR;
-}
+animateLoop();
 
-// Larger markers on the joints that matter most for reading exercise
-// form at a glance; everything else stays small so it doesn't clutter
-// the figure.
-const MAJOR_JOINTS = new Set([11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]);
-
-function frameToTraces(points) {
-  const boneTraces = [];
-  const allBones = [...bones];
-  if (points["neck"] && points["head"]) {
-    allBones.push(["neck", "head"]);
-  }
-  for (const [a, b] of allBones) {
-    const pa = points[String(a)];
-    const pb = points[String(b)];
-    if (!pa || !pb) continue;
-    const sideA = sideOf(String(a));
-    const sideB = sideOf(String(b));
-    // Only color a bone by side if both endpoints agree; cross-body
-    // bones (shoulder-to-shoulder, hip-to-hip, spine, neck) stay neutral
-    // so left/right reads unambiguously at a glance.
-    const side = sideA === sideB ? sideA : "center";
-    boneTraces.push({
-      type: "scatter3d",
-      mode: "lines",
-      x: [pa[0], pb[0]], y: [pa[1], pb[1]], z: [pa[2], pb[2]],
-      line: { color: colorForSide(side), width: side === "center" ? 7 : 10 },
-      hoverinfo: "skip",
-      showlegend: false,
-    });
-  }
-
-  const jx = [], jy = [], jz = [], jsize = [], jcolor = [];
-  for (const [k, v] of Object.entries(points)) {
-    jx.push(v[0]); jy.push(v[1]); jz.push(v[2]);
-    const n = parseInt(k, 10);
-    const isMajor = k === "head" || MAJOR_JOINTS.has(n);
-    jsize.push(k === "head" ? 16 : isMajor ? 11 : 5);
-    jcolor.push(k === "head" ? CENTER_COLOR : colorForSide(sideOf(k)));
-  }
-  const jointTrace = {
-    type: "scatter3d",
-    mode: "markers",
-    x: jx, y: jy, z: jz,
-    marker: { color: jcolor, size: jsize, line: { color: bgColor, width: 1 } },
-    hoverinfo: "skip",
-    showlegend: false,
-  };
-
-  return [...boneTraces, jointTrace];
+// ---------- Materials ----------
+const matLeft = new THREE.MeshStandardMaterial({ color: LEFT_COLOR, roughness: 0.5, metalness: 0.05 });
+const matRight = new THREE.MeshStandardMaterial({ color: RIGHT_COLOR, roughness: 0.5, metalness: 0.05 });
+const matCenter = new THREE.MeshStandardMaterial({ color: CENTER_COLOR, roughness: 0.5, metalness: 0.05 });
+function matForSide(side) {
+  return side === "left" ? matLeft : side === "right" ? matRight : matCenter;
 }
 
-const layout = {
-  paper_bgcolor: bgColor,
-  scene: {
-    bgcolor: bgColor,
-    xaxis: { range: [-2.2, 2.2], visible: false },
-    yaxis: { range: [-2.2, 2.2], visible: false },
-    zaxis: { range: [-2.2, 2.2], visible: false },
-    aspectmode: "cube",
-    camera: { eye: { x: 1.4, y: 1.4, z: 0.8 } },
-  },
-  margin: { l: 0, r: 0, t: 0, b: 0 },
-  uirevision: "keep", // preserve camera angle across frame changes
-};
+// ---------- Curated body segments (MediaPipe pose landmark indices) ----------
+// Only the indices that matter for a clean anatomical figure are used --
+// fingers/toes/face are intentionally ignored so it reads like a solid
+// bathroom-sign figure rather than a cloud of raw landmark dots.
+const LIMB_SEGMENTS = [
+  { name: "lUpperArm", a: 11, b: 13, side: "left", radius: 0.055 },
+  { name: "lForearm", a: 13, b: 15, side: "left", radius: 0.048 },
+  { name: "rUpperArm", a: 12, b: 14, side: "right", radius: 0.055 },
+  { name: "rForearm", a: 14, b: 16, side: "right", radius: 0.048 },
+  { name: "lThigh", a: 23, b: 25, side: "left", radius: 0.075 },
+  { name: "lShin", a: 25, b: 27, side: "left", radius: 0.06 },
+  { name: "rThigh", a: 24, b: 26, side: "right", radius: 0.075 },
+  { name: "rShin", a: 26, b: 28, side: "right", radius: 0.06 },
+  { name: "lFoot", a: 27, b: 31, side: "left", radius: 0.04 },
+  { name: "rFoot", a: 28, b: 32, side: "right", radius: 0.04 },
+  { name: "lHand", a: 15, b: 19, side: "left", radius: 0.035 },
+  { name: "rHand", a: 16, b: 20, side: "right", radius: 0.035 },
+];
 
-const plotDiv = document.getElementById("plot");
-Plotly.newPlot(plotDiv, frameToTraces(frames[0] || {}), layout, { displaylogo: false });
+const JOINT_SPHERES = [
+  { idx: 11, side: "left", radius: 0.065 },
+  { idx: 12, side: "right", radius: 0.065 },
+  { idx: 13, side: "left", radius: 0.055 },
+  { idx: 14, side: "right", radius: 0.055 },
+  { idx: 15, side: "left", radius: 0.05 },
+  { idx: 16, side: "right", radius: 0.05 },
+  { idx: 23, side: "left", radius: 0.08 },
+  { idx: 24, side: "right", radius: 0.08 },
+  { idx: 25, side: "left", radius: 0.065 },
+  { idx: 26, side: "right", radius: 0.065 },
+  { idx: 27, side: "left", radius: 0.055 },
+  { idx: 28, side: "right", radius: 0.055 },
+];
 
+// ---------- Build pooled meshes once; only transforms change per frame ----------
+const cylinderGeom = new THREE.CylinderGeometry(1, 1, 1, 14, 1);
+const sphereGeom = new THREE.SphereGeometry(1, 18, 14);
+const torsoGeom = new RoundedBoxGeometry(1, 1, 1, 4, 0.18);
+
+const limbMeshes = {};
+for (const seg of LIMB_SEGMENTS) {
+  const mesh = new THREE.Mesh(cylinderGeom, matForSide(seg.side));
+  mesh.visible = false;
+  scene.add(mesh);
+  limbMeshes[seg.name] = mesh;
+}
+
+const jointMeshes = {};
+for (const j of JOINT_SPHERES) {
+  const mesh = new THREE.Mesh(sphereGeom, matForSide(j.side));
+  mesh.visible = false;
+  scene.add(mesh);
+  jointMeshes[j.idx] = mesh;
+}
+
+const neckMesh = new THREE.Mesh(cylinderGeom, matCenter);
+neckMesh.visible = false;
+scene.add(neckMesh);
+
+const headMesh = new THREE.Mesh(sphereGeom, matCenter);
+headMesh.visible = false;
+scene.add(headMesh);
+
+const torsoMesh = new THREE.Mesh(torsoGeom, matCenter);
+torsoMesh.visible = false;
+scene.add(torsoMesh);
+
+// ---------- Per-frame transform helpers ----------
+const UP = new THREE.Vector3(0, 1, 0);
+const _dir = new THREE.Vector3();
+const _mid = new THREE.Vector3();
+const _quat = new THREE.Quaternion();
+
+function pointOf(points, key) {
+  const v = points[key];
+  if (!v) return null;
+  // Exporter writes (x, -z, -y): slot 1 is depth-toward-camera, slot 2
+  // is vertical-up. Three.js treats the *second* component as vertical,
+  // so slots 1 and 2 must be swapped here, or every mesh's "up" axis
+  // ends up pointing along depth instead (this was the "torso facing
+  // the sky" bug).
+  return new THREE.Vector3(v[0] + CURRENT_OFFSET.x, v[2] + CURRENT_OFFSET.y, v[1] + CURRENT_OFFSET.z);
+}
+
+function swappedRaw(points, key) {
+  const v = points[key];
+  return v ? { x: v[0], y: v[2], z: v[1] } : null;
+}
+
+const FEET_INDICES = ["27", "28", "29", "30", "31", "32"]; // ankles, heels, foot-index
+
+// Horizontal (X/Z) centering is computed once from frame 0 only, so the
+// figure doesn't drift sideways frame to frame -- this part is fine to
+// fix once. Vertical grounding, however, is recomputed every frame
+// (see computeFloorOffset below): MediaPipe's world landmarks are
+// hip-root-relative, not an absolute position in the room, so the
+// estimated hip-to-ankle distance drifts slightly as knees bend. A
+// single frame-0 floor offset makes squats/lunges appear to sink into
+// or float above the grid; snapping the lowest foot point to the floor
+// every frame keeps feet planted regardless of that per-frame drift.
+function computeCenterXZ() {
+  const raw = frames[0] || {};
+  const lHip = swappedRaw(raw, "23");
+  const rHip = swappedRaw(raw, "24");
+  if (lHip && rHip) {
+    return { x: -(lHip.x + rHip.x) / 2, z: -(lHip.z + rHip.z) / 2 };
+  }
+  return { x: 0, z: 0 };
+}
+const CENTER_XZ = computeCenterXZ();
+
+function computeFloorOffsetY(points) {
+  let floorY = Infinity;
+  let any = false;
+  for (const k of FEET_INDICES) {
+    const p = swappedRaw(points, k);
+    if (p) { floorY = Math.min(floorY, p.y); any = true; }
+  }
+  if (!any) {
+    for (const k of Object.keys(points)) {
+      const p = swappedRaw(points, k);
+      if (p) floorY = Math.min(floorY, p.y);
+    }
+  }
+  return Number.isFinite(floorY) ? -floorY : 0;
+}
+
+let CURRENT_OFFSET = { x: CENTER_XZ.x, y: 0, z: CENTER_XZ.z };
+
+// Orients + scales a unit cylinder mesh to span from a to b.
+function placeCylinder(mesh, a, b, radius) {
+  if (!a || !b) { mesh.visible = false; return; }
+  const length = a.distanceTo(b);
+  if (length < 1e-5) { mesh.visible = false; return; }
+  _mid.addVectors(a, b).multiplyScalar(0.5);
+  _dir.subVectors(b, a).normalize();
+  _quat.setFromUnitVectors(UP, _dir);
+  mesh.position.copy(_mid);
+  mesh.quaternion.copy(_quat);
+  mesh.scale.set(radius, length, radius);
+  mesh.visible = true;
+}
+
+function placeSphere(mesh, p, radius) {
+  if (!p) { mesh.visible = false; return; }
+  mesh.position.copy(p);
+  mesh.scale.setScalar(radius);
+  mesh.visible = true;
+}
+
+// Torso is oriented with its own basis (not just an up-vector) so it
+// twists correctly with the shoulder line instead of just pointing
+// shoulder-mid to hip-mid with an arbitrary roll.
+const _yAxis = new THREE.Vector3();
+const _xAxis = new THREE.Vector3();
+const _zAxis = new THREE.Vector3();
+const _basis = new THREE.Matrix4();
+
+function placeTorso(mesh, shoulderMid, hipMid, shoulderVec, shoulderWidth) {
+  if (!shoulderMid || !hipMid) { mesh.visible = false; return; }
+  const height = shoulderMid.distanceTo(hipMid);
+  if (height < 1e-5) { mesh.visible = false; return; }
+  _yAxis.subVectors(shoulderMid, hipMid).normalize();
+  _xAxis.copy(shoulderVec).normalize();
+  const proj = _xAxis.dot(_yAxis);
+  _xAxis.addScaledVector(_yAxis, -proj).normalize(); // re-orthogonalize so the box doesn't shear
+  _zAxis.crossVectors(_xAxis, _yAxis).normalize();
+  _basis.makeBasis(_xAxis, _yAxis, _zAxis);
+  _quat.setFromRotationMatrix(_basis);
+  _mid.addVectors(shoulderMid, hipMid).multiplyScalar(0.5);
+  mesh.position.copy(_mid);
+  mesh.quaternion.copy(_quat);
+  const width = Math.max(shoulderWidth, 0.18);
+  mesh.scale.set(width, height, width * 0.55);
+  mesh.visible = true;
+}
+
+function showFrame(i) {
+  const points = frames[i] || {};
+  frameLabel.textContent = `${i} / ${Math.max(0, numFrames - 1)}`;
+
+  CURRENT_OFFSET = { x: CENTER_XZ.x, y: computeFloorOffsetY(points), z: CENTER_XZ.z };
+
+  for (const seg of LIMB_SEGMENTS) {
+    const a = pointOf(points, String(seg.a));
+    const b = pointOf(points, String(seg.b));
+    placeCylinder(limbMeshes[seg.name], a, b, seg.radius);
+  }
+
+  for (const j of JOINT_SPHERES) {
+    placeSphere(jointMeshes[j.idx], pointOf(points, String(j.idx)), j.radius);
+  }
+
+  const lShoulder = pointOf(points, "11");
+  const rShoulder = pointOf(points, "12");
+  const lHip = pointOf(points, "23");
+  const rHip = pointOf(points, "24");
+
+  let shoulderMid = null, hipMid = null, shoulderVec = null, shoulderWidth = 0.3;
+  if (lShoulder && rShoulder) {
+    shoulderMid = lShoulder.clone().add(rShoulder).multiplyScalar(0.5);
+    shoulderVec = rShoulder.clone().sub(lShoulder);
+    shoulderWidth = shoulderVec.length();
+  }
+  if (lHip && rHip) {
+    hipMid = lHip.clone().add(rHip).multiplyScalar(0.5);
+  }
+  if (shoulderMid && hipMid && shoulderVec) {
+    placeTorso(torsoMesh, shoulderMid, hipMid, shoulderVec, shoulderWidth);
+  } else {
+    torsoMesh.visible = false;
+  }
+
+  // Head position: prefer the synthetic "head" point (present when the
+  // exporter's SHOW_ALL_LANDMARKS is False), else fall back to the nose
+  // landmark (index 0), which is present when it's True.
+  const headPos = pointOf(points, "head") || pointOf(points, "0");
+  const neckBase = pointOf(points, "neck") || shoulderMid;
+
+  if (headPos) {
+    placeSphere(headMesh, headPos, Math.max(shoulderWidth * 0.32, 0.11));
+  } else {
+    headMesh.visible = false;
+  }
+  if (headPos && neckBase) {
+    placeCylinder(neckMesh, neckBase, headPos, 0.05);
+  } else {
+    neckMesh.visible = false;
+  }
+}
+
+// ---------- Controls ----------
 const slider = document.getElementById("slider");
 const frameLabel = document.getElementById("frameLabel");
 const playBtn = document.getElementById("playBtn");
 const speedSelect = document.getElementById("speed");
 slider.max = Math.max(0, numFrames - 1);
 
-function showFrame(i) {
-  Plotly.react(plotDiv, frameToTraces(frames[i] || {}), layout, { displaylogo: false });
-  frameLabel.textContent = `${i} / ${numFrames - 1}`;
-}
 showFrame(0);
-
 slider.addEventListener("input", () => showFrame(parseInt(slider.value, 10)));
 
 let playing = false;
