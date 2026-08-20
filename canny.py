@@ -6,38 +6,14 @@ import cv2 as cv
 import numpy as np
 from tqdm import tqdm
 
+import config
+from sam2_segment import Sam2Segmenter, build_config_from_settings
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-input_video_path = "materials/videos/test.mp4"
-output_folder = "output"
-
-# Preset 3 = balanced
-bg_color_rgb = [20, 23, 31]       # #14171F
-line_color_rgb = [155, 111, 224]  # mobility purple
-
-use_clahe = True
-clahe_clip_limit = 1.5
-clahe_tile_grid_size = (8, 8)
-
-gaussian_ksize = (5, 5)
-
-canny_low_threshold = 40
-canny_high_threshold = 120
-
-sobel_threshold = 60
-use_sobel = True
-
-open_ksize = (2, 2)
-close_ksize = (3, 3)
-dilation_ksize = (2, 2)
 
 
 # ============================================================
@@ -61,27 +37,32 @@ def create_kernel(size: tuple[int, int]) -> np.ndarray:
 # EDGE PIPELINE
 # ============================================================
 
-def edge_detect(image: np.ndarray) -> np.ndarray:
+def edge_detect(image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    """
+    mask, if provided, is a (H, W) bool array. Edge detection still runs
+    on the full frame (so gradients at the mask boundary are accurate),
+    but the result is zeroed outside the mask afterward.
+    """
     gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
 
-    if use_clahe:
+    if config.use_clahe:
         clahe = cv.createCLAHE(
-            clipLimit=clahe_clip_limit,
-            tileGridSize=clahe_tile_grid_size
+            clipLimit=config.clahe_clip_limit,
+            tileGridSize=config.clahe_tile_grid_size
         )
         gray = clahe.apply(gray)
 
-    blurred = cv.GaussianBlur(gray, gaussian_ksize, 0)
+    blurred = cv.GaussianBlur(gray, config.gaussian_ksize, 0)
 
     canny_edges = cv.Canny(
         blurred,
-        canny_low_threshold,
-        canny_high_threshold
+        config.canny_low_threshold,
+        config.canny_high_threshold
     )
 
     combined = canny_edges
 
-    if use_sobel:
+    if config.use_sobel:
         sobel_x = cv.Sobel(blurred, cv.CV_32F, 1, 0, ksize=3)
         sobel_y = cv.Sobel(blurred, cv.CV_32F, 0, 1, ksize=3)
 
@@ -90,34 +71,58 @@ def edge_detect(image: np.ndarray) -> np.ndarray:
 
         _, sobel_edges = cv.threshold(
             magnitude,
-            sobel_threshold,
+            config.sobel_threshold,
             255,
             cv.THRESH_BINARY
         )
 
         combined = cv.bitwise_or(canny_edges, sobel_edges)
 
-    open_kernel = create_kernel(open_ksize)
+    open_kernel = create_kernel(config.open_ksize)
     combined = cv.morphologyEx(combined, cv.MORPH_OPEN, open_kernel)
 
-    close_kernel = create_kernel(close_ksize)
+    close_kernel = create_kernel(config.close_ksize)
     combined = cv.morphologyEx(combined, cv.MORPH_CLOSE, close_kernel)
 
-    dilate_kernel = create_kernel(dilation_ksize)
+    dilate_kernel = create_kernel(config.dilation_ksize)
     combined = cv.dilate(combined, dilate_kernel, iterations=1)
+
+    if mask is not None:
+        mask_u8 = (mask.astype(np.uint8)) * 255
+        if config.sam2_mask_dilate_ksize is not None:
+            dilate_kernel = create_kernel(config.sam2_mask_dilate_ksize)
+            mask_u8 = cv.dilate(mask_u8, dilate_kernel, iterations=1)
+        combined = cv.bitwise_and(combined, mask_u8)
 
     return combined
 
 
-def recolor(edge_image: np.ndarray) -> np.ndarray:
+def recolor(edge_image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    """
+    mask, if provided, fills the SAM2 subject silhouette with line_color
+    as a flat base (clean outer contour, no background noise), then
+    overlays internal edges on top so limbs stay visible when crossing
+    in front of the torso or each other. Without a mask, behaves as
+    before: background everywhere, edges drawn in line_color.
+    """
     height, width = edge_image.shape
     result = np.empty((height, width, 3), dtype=np.uint8)
 
-    bg_bgr = bgr_from_rgb(bg_color_rgb)
-    line_bgr = bgr_from_rgb(line_color_rgb)
+    bg_bgr = bgr_from_rgb(config.bg_color_rgb)
+    line_bgr = bgr_from_rgb(config.line_color_rgb)
 
     result[:] = bg_bgr
-    result[edge_image > 0] = line_bgr
+
+    if mask is not None:
+        # Flat silhouette fill first, so the whole subject reads as one
+        # clean shape even where internal edges are faint or missed.
+        result[mask] = line_bgr
+        # Internal edges drawn in the background color, so they read as
+        # "cut lines" separating limbs/torso within the filled shape,
+        # rather than adding more purple on purple.
+        result[edge_image > 0] = bg_bgr
+    else:
+        result[edge_image > 0] = line_bgr
 
     return result
 
@@ -150,6 +155,17 @@ def process_video(input_path: str, output_path: str) -> None:
         video.release()
         raise RuntimeError(f"Could not create output video: {output_path}")
 
+    # --- SAM2 segmentation runs first, as its own pass over the whole
+    # video, and is completely decoupled from the edge-detection loop
+    # below. mask_iter is None when disabled, so the frame loop doesn't
+    # need to branch on use_sam2 at all.
+    mask_iter = None
+    if config.use_sam2:
+        logger.info("Running SAM2 segmentation pass...")
+        segmenter = Sam2Segmenter(build_config_from_settings())
+        segmenter.prepare_frames(input_path)
+        mask_iter = segmenter.propagate_masks()
+
     progress = tqdm(total=total_frames, desc="Processing frame...")
 
     while True:
@@ -157,8 +173,10 @@ def process_video(input_path: str, output_path: str) -> None:
         if not success:
             break
 
-        edges = edge_detect(frame)
-        output_frame = recolor(edges)
+        mask = next(mask_iter) if mask_iter is not None else None
+
+        edges = edge_detect(frame, mask=mask)
+        output_frame = recolor(edges, mask=mask)
         writer.write(output_frame)
         progress.update(1)
 
@@ -174,10 +192,10 @@ def process_video(input_path: str, output_path: str) -> None:
 # ============================================================
 
 if __name__ == "__main__":
-    filename_noext = Path(input_video_path).stem
+    filename_noext = Path(config.input_video_path).stem
     output_video_path = os.path.join(
-        output_folder,
+        config.output_folder,
         f"{filename_noext}-[balanced].mp4"
     )
 
-    process_video(input_video_path, output_video_path)
+    process_video(config.input_video_path, output_video_path)
