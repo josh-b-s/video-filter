@@ -16,7 +16,7 @@ import os
 # INPUT / OUTPUT
 # ============================================================
 
-input_video_path = "materials/videos/pullup.mp4"
+input_video_path = "materials/videos/test.mp4"
 output_folder = "output"
 
 sam2_frame_extraction_dir = "output/_sam2_frames"
@@ -61,19 +61,34 @@ dilation_ksize = (2, 2)
 # When enabled, edge detection is restricted to the SAM2-segmented
 # foreground subject, and the subject is filled as a flat silhouette
 # so limbs stay readable even when crossing in front of the body.
-use_sam2 = False
+use_sam2 = True
 
-sam2_checkpoint_path = "checkpoints/sam2.1_hiera_tiny.pt"
-sam2_model_config_path = "configs/sam2.1/sam2.1_hiera_t.yaml"
+sam2_checkpoint_path = "EdgeTAM/checkpoints/edgetam.pt"
+sam2_model_config_path = "configs/edgetam.yaml"
 
 sam2_vos_optimized = False           # torch.compile fast path - Linux only, needs Triton
-sam2_offload_video_to_cpu = False    # True = safer on low VRAM, slower (CPU<->GPU shuttling)
-sam2_offload_state_to_cpu = False    # True = safer on low VRAM, slower
+sam2_offload_video_to_cpu = False    # EdgeTAM is light enough to skip offload even on 4GB
+sam2_offload_state_to_cpu = False    # EdgeTAM is light enough to skip offload even on 4GB
 
 # Grow the mask slightly so edges right at the subject's silhouette
 # aren't clipped off. Only affects internal edge clipping, not the
 # outer silhouette fill (which stays tight to the true mask).
 sam2_mask_dilate_ksize = (15, 15)
+
+# Draws a stroke along the outer silhouette boundary (the mask's own
+# contour). Set thickness to 0 to disable. Higher = chunkier outline;
+# grows both inward and outward from the true mask boundary.
+sam2_outline_thickness = 8
+
+# "filled": subject silhouette filled with line_color, internal edges
+#           (limb crossover etc.) drawn in bg_color on top, outline
+#           drawn in bg_color too (barely visible - line_color already
+#           contrasts against bg_color at the boundary).
+# "outline": inverted - background stays bg_color everywhere, subject
+#            interior is NOT filled, only the outline stroke and
+#            internal edges are drawn, both in line_color. Looks like
+#            pure line art constrained to the subject's shape.
+sam2_style = "outline"
 
 # How many sampled frames test_sam2.py saves as overlay previews.
 sam2_test_num_preview_frames = 8

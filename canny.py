@@ -99,11 +99,21 @@ def edge_detect(image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray
 
 def recolor(edge_image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
     """
-    mask, if provided, fills the SAM2 subject silhouette with line_color
-    as a flat base (clean outer contour, no background noise), then
-    overlays internal edges on top so limbs stay visible when crossing
-    in front of the torso or each other. Without a mask, behaves as
-    before: background everywhere, edges drawn in line_color.
+    mask, if provided, controls how the SAM2 subject silhouette is
+    rendered, per config.sam2_style:
+
+    "filled": subject filled with line_color as a flat base (clean
+        outer contour, no background noise), with internal edges
+        (limb crossover etc.) drawn in bg_color on top so limbs stay
+        visible when crossing in front of the torso or each other.
+
+    "outline": inverted - background stays bg_color everywhere inside
+        AND outside the subject. Only the silhouette's outline stroke
+        and internal edges are drawn, both in line_color, giving pure
+        line art constrained to the subject's shape.
+
+    Without a mask, behaves as before: background everywhere, edges
+    drawn in line_color.
     """
     height, width = edge_image.shape
     result = np.empty((height, width, 3), dtype=np.uint8)
@@ -114,13 +124,30 @@ def recolor(edge_image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarra
     result[:] = bg_bgr
 
     if mask is not None:
-        # Flat silhouette fill first, so the whole subject reads as one
-        # clean shape even where internal edges are faint or missed.
-        result[mask] = line_bgr
-        # Internal edges drawn in the background color, so they read as
-        # "cut lines" separating limbs/torso within the filled shape,
-        # rather than adding more purple on purple.
-        result[edge_image > 0] = bg_bgr
+        outline_mask = None
+        if config.sam2_outline_thickness > 0:
+            mask_u8 = (mask.astype(np.uint8)) * 255
+            contours, _ = cv.findContours(mask_u8, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+            outline_mask = np.zeros((height, width), dtype=np.uint8)
+            cv.drawContours(outline_mask, contours, -1, 255, thickness=config.sam2_outline_thickness)
+
+        if config.sam2_style == "outline":
+            # Background stays everywhere; only draw the outline stroke
+            # and internal edges, both in line_color.
+            if outline_mask is not None:
+                result[outline_mask > 0] = line_bgr
+            result[edge_image > 0] = line_bgr
+        else:
+            # "filled" (default): flat silhouette fill first, so the
+            # whole subject reads as one clean shape even where
+            # internal edges are faint or missed.
+            result[mask] = line_bgr
+            # Internal edges drawn in the background color, so they
+            # read as "cut lines" separating limbs/torso within the
+            # filled shape, rather than adding more purple on purple.
+            result[edge_image > 0] = bg_bgr
+            if outline_mask is not None:
+                result[outline_mask > 0] = bg_bgr
     else:
         result[edge_image > 0] = line_bgr
 
@@ -164,6 +191,12 @@ def process_video(input_path: str, output_path: str) -> None:
         logger.info("Running SAM2 segmentation pass...")
         segmenter = Sam2Segmenter(build_config_from_settings())
         segmenter.prepare_frames(input_path)
+        if segmenter._num_frames != total_frames:
+            raise RuntimeError(
+                f"SAM2 extracted {segmenter._num_frames} frames but the video has "
+                f"{total_frames} frames according to VideoCapture - these should always "
+                f"match. Try deleting {config.sam2_frame_extraction_dir} and rerunning."
+            )
         mask_iter = segmenter.propagate_masks()
 
     progress = tqdm(total=total_frames, desc="Processing frame...")
