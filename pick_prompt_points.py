@@ -34,6 +34,7 @@ Usage:
     python pick_prompt_points.py
 """
 
+import ctypes
 import json
 import logging
 import os
@@ -59,9 +60,31 @@ point_radius = 6
 # STATE
 # ============================================================
 
-points: list[tuple[int, int]] = []
+points: list[tuple[int, int]] = []  # always stored in ORIGINAL frame coordinates
 labels: list[int] = []
 predictor = None  # SAM2ImagePredictor, built lazily
+display_scale = 1.0  # set in main() based on screen size vs frame size
+
+
+def get_screen_size() -> tuple[int, int]:
+    """Returns (width, height) of the primary screen. Falls back to a
+    conservative default if detection fails (e.g. non-Windows)."""
+    try:
+        user32 = ctypes.windll.user32
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        return 1280, 800
+
+
+def fit_to_screen(image: np.ndarray, max_width: int, max_height: int) -> tuple[np.ndarray, float]:
+    """Scales image down (never up) to fit within max_width x max_height,
+    preserving aspect ratio. Returns (scaled_image, scale_factor)."""
+    h, w = image.shape[:2]
+    scale = min(max_width / w, max_height / h, 1.0)
+    if scale >= 1.0:
+        return image, 1.0
+    new_size = (int(w * scale), int(h * scale))
+    return cv.resize(image, new_size, interpolation=cv.INTER_AREA), scale
 
 
 def build_predictor():
@@ -116,20 +139,30 @@ def redraw(base_frame):
         cv.circle(display, (x, y), point_radius, color, -1)
         cv.circle(display, (x, y), point_radius, (255, 255, 255), 2)
 
+    if display_scale < 1.0:
+        new_size = (int(display.shape[1] * display_scale), int(display.shape[0] * display_scale))
+        display = cv.resize(display, new_size, interpolation=cv.INTER_AREA)
+
     cv.imshow(window_name, display)
 
 
 def on_mouse(event, x, y, flags, param):
     base_frame = param
+    # Clicks arrive in DISPLAYED (possibly scaled-down) coordinates -
+    # convert back to original frame coordinates before storing, since
+    # SAM2 and the saved prompt_points.json must use true pixel coords.
+    orig_x = int(round(x / display_scale))
+    orig_y = int(round(y / display_scale))
+
     if event == cv.EVENT_LBUTTONDOWN:
-        points.append((x, y))
+        points.append((orig_x, orig_y))
         labels.append(1)
-        logger.info(f"Added FOREGROUND point at ({x}, {y})")
+        logger.info(f"Added FOREGROUND point at ({orig_x}, {orig_y})")
         redraw(base_frame)
     elif event == cv.EVENT_RBUTTONDOWN:
-        points.append((x, y))
+        points.append((orig_x, orig_y))
         labels.append(0)
-        logger.info(f"Added BACKGROUND point at ({x}, {y})")
+        logger.info(f"Added BACKGROUND point at ({orig_x}, {orig_y})")
         redraw(base_frame)
 
 
@@ -151,6 +184,8 @@ def save_points():
 
 
 def main() -> None:
+    global display_scale
+
     if not os.path.exists(config.input_video_path):
         raise FileNotFoundError(f"Video not found: {config.input_video_path}")
 
@@ -164,6 +199,10 @@ def main() -> None:
         raise RuntimeError("Could not read frame 0 from video.")
 
     logger.info(f"Frame size: {frame.shape[1]}x{frame.shape[0]}")
+
+    screen_w, screen_h = get_screen_size()
+    _, display_scale = fit_to_screen(frame, screen_w - 100, screen_h - 150)
+    logger.info(f"Screen: {screen_w}x{screen_h} - display scale: {display_scale:.3f}")
 
     # Load the model up front so the first click doesn't stall the UI.
     build_predictor()

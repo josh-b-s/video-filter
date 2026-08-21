@@ -87,6 +87,9 @@ def edge_detect(image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray
     dilate_kernel = create_kernel(config.dilation_ksize)
     combined = cv.dilate(combined, dilate_kernel, iterations=1)
 
+    if config.edge_min_component_area > 0:
+        combined = remove_small_components(combined, config.edge_min_component_area)
+
     if mask is not None:
         mask_u8 = (mask.astype(np.uint8)) * 255
         if config.sam2_mask_dilate_ksize is not None:
@@ -95,6 +98,20 @@ def edge_detect(image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray
         combined = cv.bitwise_and(combined, mask_u8)
 
     return combined
+
+
+def remove_small_components(binary_image: np.ndarray, min_area: int) -> np.ndarray:
+    """
+    Drops connected white blobs smaller than min_area pixels from a
+    binary (0/255) image. Used to strip speckle noise from edge maps
+    while leaving real, larger contour lines untouched.
+    """
+    num_labels, labels, stats, _ = cv.connectedComponentsWithStats(binary_image, connectivity=8)
+    cleaned = np.zeros_like(binary_image)
+    for label in range(1, num_labels):  # label 0 is background
+        if stats[label, cv.CC_STAT_AREA] >= min_area:
+            cleaned[labels == label] = 255
+    return cleaned
 
 
 def recolor(edge_image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:

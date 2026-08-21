@@ -16,7 +16,7 @@ import os
 # INPUT / OUTPUT
 # ============================================================
 
-input_video_path = "materials/videos/test.mp4"
+input_video_path = "materials/videos/pullup.mp4"
 output_folder = "output"
 
 sam2_frame_extraction_dir = "output/_sam2_frames"
@@ -67,13 +67,32 @@ sam2_checkpoint_path = "EdgeTAM/checkpoints/edgetam.pt"
 sam2_model_config_path = "configs/edgetam.yaml"
 
 sam2_vos_optimized = False           # torch.compile fast path - Linux only, needs Triton
-sam2_offload_video_to_cpu = False    # EdgeTAM is light enough to skip offload even on 4GB
-sam2_offload_state_to_cpu = False    # EdgeTAM is light enough to skip offload even on 4GB
+
+# Frame loading offload: init_state() loads every decoded video frame
+# into VRAM at once before segmentation starts, regardless of model
+# size (EdgeTAM vs tiny SAM2 makes no difference here - this is a raw
+# frame-count x resolution memory cost). On a 4GB card, short clips
+# (~100 frames) fit fine with both False; longer clips (1000+ frames)
+# will OOM unless offload_video_to_cpu is True. If you still OOM with
+# both True, the clip needs to be shorter or downscaled - offload
+# alone won't fix an unbounded frame count.
+sam2_offload_video_to_cpu = True
+sam2_offload_state_to_cpu = True
 
 # Grow the mask slightly so edges right at the subject's silhouette
 # aren't clipped off. Only affects internal edge clipping, not the
-# outer silhouette fill (which stays tight to the true mask).
-sam2_mask_dilate_ksize = (15, 15)
+# outer silhouette fill (which stays tight to the true mask). Larger
+# values catch more boundary detail but also let more background
+# clutter just outside the person leak through as edge "specks" -
+# if you see stray noise just outside the outline, shrink this.
+sam2_mask_dilate_ksize = (0, 0)
+
+# Removes small, disconnected edge fragments (speckle noise) after
+# Canny/Sobel/morphology - any connected blob of edge pixels smaller
+# than this area (in pixels) is dropped entirely. Real limb/silhouette
+# contours are large and connected, so this only strips noise. Set to
+# 0 to disable.
+edge_min_component_area = 40
 
 # Draws a stroke along the outer silhouette boundary (the mask's own
 # contour). Set thickness to 0 to disable. Higher = chunkier outline;
