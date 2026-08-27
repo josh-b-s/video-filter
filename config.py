@@ -16,7 +16,7 @@ import os
 # INPUT / OUTPUT
 # ============================================================
 
-input_video_path = "materials/videos/pullup.mp4"
+input_video_path = "materials/videos/test.mp4"
 output_folder = "output"
 
 sam2_frame_extraction_dir = "output/_sam2_frames"
@@ -52,6 +52,79 @@ use_sobel = True
 open_ksize = (2, 2)
 close_ksize = (3, 3)
 dilation_ksize = (2, 2)
+
+# Replaces the actual face-contour region (via MediaPipe's face mesh,
+# not a rough ellipse) with a single flat color in the source frame,
+# before edge detection runs - guaranteeing zero internal gradient
+# there, rather than relying on a blur being "strong enough". This
+# never touches the SAM2 mask, so the head's outer silhouette
+# (hairline, jaw, chin, ears) stays exactly as filled as the rest of
+# the body - only the frame content inside the face is altered. If no
+# face is detected in a given frame (person facing away, steep angle,
+# motion blur), that frame is left alone - check the
+# "Face detection: X/Y frames" log line after a run to see how often
+# that happened; if X is 0 or very low, try lowering
+# face_detection_confidence below.
+#
+# Requires the model file below. Download:
+#   https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+# Save it somewhere in your project and point the path below at it.
+use_face_blur = True
+face_landmarker_model_path = "models/face_landmarker.task"
+
+# Minimum confidence (0-1) for MediaPipe to count a face as detected.
+# Default MediaPipe behavior is 0.5, which can silently skip most/all
+# frames on footage with motion blur, extreme camera angles, or a
+# partially out-of-frame face - all common in workout clips. Lower
+# this if the "Face detection: X/Y frames" summary log shows a low
+# hit rate; raise it if it's flattening things that aren't actually
+# faces.
+face_detection_confidence = 0.2
+
+# How wide the blend between the flat-fill and normal-body is. Larger
+# = softer/more gradual transition at the face's edge; smaller = a
+# more defined (but still soft, never hard) boundary. Must be odd.
+face_blur_feather_ksize = (51, 51)
+
+# Face detection searches the WHOLE person region (via the SAM2 mask)
+# rather than assuming the head is in any particular position - this
+# is what makes it robust to any pose (hanging, lying flat, sideways,
+# arms overhead), not just upright-with-head-on-top. It works by
+# splitting the person's bounding box into an overlapping grid of
+# tiles and trying detection on each (upscaled) tile in turn.
+#
+# face_search_tile_grid is (rows, cols) for that grid - more tiles
+# search more thoroughly (better for unusual poses) at the cost of
+# more detector calls per frame when early tiles miss. face_search_
+# tile_overlap is how much adjacent tiles overlap (as a fraction of
+# tile size) so a face isn't missed by falling right on a tile seam.
+# head_crop_upscale_target is the pixel size each tile's longer side
+# is scaled up to before detection - higher gives the detector a
+# "more zoomed in" view for very small/distant faces, at the cost of
+# a bit more per-frame compute.
+face_search_tile_grid = (3, 2)  # (rows, cols)
+face_search_tile_overlap = 0.2
+head_crop_upscale_target = 512
+
+# Once the tile-grid search finds a face, a CSRT correlation tracker
+# (OpenCV's built-in cv2.TrackerCSRT) takes over for subsequent frames
+# instead of re-running the full tile search every time - much
+# cheaper, since it's just following the already-found face rather
+# than searching the whole body again. Requires opencv-contrib-python
+# (not plain opencv-python) - CSRT is contrib-only regardless of
+# OpenCV version. If no usable tracker API is found on your OpenCV
+# install, this silently falls back to running the full tile-grid
+# search every frame instead (slower, but still correct) - a warning
+# is logged once if that happens.
+use_face_tracking = True
+
+# How many consecutive frames the tracker's reported position is
+# allowed to fail to yield a detected face before giving up on it and
+# re-acquiring via a fresh full tile-grid search. Higher tolerates
+# more transient misses (motion blur, brief occlusion) before paying
+# for a re-search; lower re-acquires sooner if the tracker has drifted
+# off the real face.
+face_tracker_max_miss_streak = 5
 
 
 # ============================================================

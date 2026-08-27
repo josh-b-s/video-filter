@@ -34,6 +34,501 @@ def create_kernel(size: tuple[int, int]) -> np.ndarray:
 
 
 # ============================================================
+# FACE REGION FLATTENING
+# ============================================================
+# Replaces the actual face-contour region (not a rough ellipse) with
+# a single flat color, sampled from the face's own average skin tone,
+# BEFORE edge detection runs - so there is exactly zero internal
+# gradient there for Canny/Sobel to find, guaranteed, rather than
+# relying on a strong-enough blur to suppress detail. The head's
+# OUTER silhouette (hairline, jaw, chin, ears) is completely
+# untouched, since that comes from the SAM2 mask in recolor(), not
+# from this step - only the frame content inside the face oval is
+# replaced before Canny/Sobel ever see it.
+#
+# Uses MediaPipe's FaceLandmarker (the modern "Tasks" API - the older
+# "Solutions" API this project might have referenced before has been
+# dropped from recent mediapipe pip builds). FaceLandmarker returns a
+# full 478-point face mesh per detected face, from which we take the
+# predefined face-oval landmark subset to build an actual face-shaped
+# mask via convex hull, rather than approximating with an ellipse.
+
+import mediapipe as mp
+from mediapipe.tasks.python.vision import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    RunningMode,
+    FaceLandmarksConnections,
+)
+from mediapipe.tasks.python.core.base_options import BaseOptions
+
+_FACE_OVAL_INDICES = sorted({
+    idx
+    for connection in FaceLandmarksConnections.FACE_LANDMARKS_FACE_OVAL
+    for idx in (connection.start, connection.end)
+})
+
+_face_landmarker = None
+
+# Running counts so a full-video run reports how often detection
+# actually succeeded - if this comes out as 0/N, the model isn't
+# finding a face at all (angle/motion blur/confidence too strict),
+# which looks identical to "the effect did nothing" from the output
+# video alone, so it's worth being able to tell the difference.
+_face_detect_attempts = 0
+_face_detect_hits = 0
+
+# CSRT tracker state - once the (expensive, pose-robust) tile-grid
+# search finds a face, its bounding box is handed to a cheap
+# correlation tracker so subsequent frames can skip re-running the
+# full tile search every time. Reset to None whenever tracking is
+# lost/stale, which triggers a fresh tile-grid search to re-acquire.
+_face_tracker = None
+_face_tracker_miss_streak = 0
+
+
+def _create_csrt_tracker():
+    """
+    OpenCV's tracker API surface differs across versions/packages
+    (cv2.TrackerCSRT_create() in older opencv-contrib-python, the
+    class-factory cv2.TrackerCSRT.create() in OpenCV 5, or under
+    cv2.legacy in some in-between versions) - try each known shape
+    rather than assuming one, since guessing wrong burns a whole
+    round-trip to find out. Raises RuntimeError with a clear message
+    listing what was tried if none of them exist on this install.
+    """
+    attempts = [
+        ("cv2.TrackerCSRT.create()", lambda: cv.TrackerCSRT.create()),
+        ("cv2.TrackerCSRT_create()", lambda: cv.TrackerCSRT_create()),
+        ("cv2.legacy.TrackerCSRT.create()", lambda: cv.legacy.TrackerCSRT.create()),
+        ("cv2.legacy.TrackerCSRT_create()", lambda: cv.legacy.TrackerCSRT_create()),
+    ]
+    errors = []
+    for name, factory in attempts:
+        try:
+            return factory()
+        except AttributeError as e:
+            errors.append(f"{name}: {e}")
+            continue
+    raise RuntimeError(
+        "Could not create a CSRT tracker with any known OpenCV API shape. "
+        "This requires opencv-contrib-python (not plain opencv-python) - "
+        "CSRT is a contrib-only tracker regardless of OpenCV version. "
+        "Tried:\n" + "\n".join(errors)
+    )
+
+
+def _get_face_landmarker():
+    """
+    Lazily builds the MediaPipe FaceLandmarker. Requires the model
+    bundle at config.face_landmarker_model_path - see that setting's
+    comment in config.py for the download link.
+    """
+    global _face_landmarker
+
+    if _face_landmarker is None:
+        if not os.path.exists(config.face_landmarker_model_path):
+            raise FileNotFoundError(
+                f"Face landmarker model not found at "
+                f"'{config.face_landmarker_model_path}'. Download it from "
+                "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+                "face_landmarker/float16/1/face_landmarker.task and point "
+                "config.face_landmarker_model_path at it, or set "
+                "config.use_face_blur = False to disable this feature."
+            )
+
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=config.face_landmarker_model_path),
+            running_mode=RunningMode.IMAGE,
+            num_faces=1,
+            # Lowered from the 0.5 default - workout footage tends to
+            # have motion blur, extreme up-angle camera positions, and
+            # partially-out-of-frame faces, all of which make the
+            # default threshold too strict and silently skip every
+            # frame with no error or warning.
+            min_face_detection_confidence=config.face_detection_confidence,
+            min_face_presence_confidence=config.face_detection_confidence,
+        )
+        _face_landmarker = FaceLandmarker.create_from_options(options)
+
+    return _face_landmarker
+
+
+def detect_face_oval_points(image_bgr: np.ndarray, count_attempt: bool = True) -> np.ndarray | None:
+    """
+    Runs the face landmarker on whatever image is passed in (this may
+    be a small cropped-and-upscaled tile, not the full frame - see
+    get_head_crop) and returns the face-oval landmark points in that
+    image's OWN local pixel coordinates.
+
+    count_attempt controls whether this call counts toward the
+    per-frame hit-rate summary log. When searching multiple tiles per
+    frame, only the overall per-frame result should count once -
+    intermediate tile tries pass count_attempt=False so the summary
+    reflects "frames with a face found", not "tiles checked".
+
+    Returns None if no face is found - callers should treat that as
+    "nothing detected", not an error.
+    """
+    global _face_detect_attempts, _face_detect_hits
+
+    landmarker = _get_face_landmarker()
+    height, width = image_bgr.shape[:2]
+
+    image_rgb = cv.cvtColor(image_bgr, cv.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+    result = landmarker.detect(mp_image)
+
+    if count_attempt:
+        _face_detect_attempts += 1
+
+    if not result.face_landmarks:
+        return None
+
+    if count_attempt:
+        _face_detect_hits += 1
+
+    # Assume the first/only detected face is the subject.
+    landmarks = result.face_landmarks[0]
+    return np.array([
+        (landmarks[i].x * width, landmarks[i].y * height)
+        for i in _FACE_OVAL_INDICES
+    ], dtype=np.float32)
+
+
+def _make_person_tiles(
+    person_bbox: tuple[int, int, int, int],
+    frame_shape: tuple[int, int],
+) -> list[tuple[int, int, int, int]]:
+    """
+    Splits the person's bounding box into an overlapping grid of tiles
+    covering the WHOLE body - not just an assumed head region. This is
+    what makes head-finding robust to any pose (hanging, lying flat,
+    sideways, arms overhead, upside-down) without assuming where the
+    head is: every part of the body gets an equal, independently-
+    upscaled chance at detection, rather than betting on a fixed
+    fraction/position heuristic that only holds for one pose family.
+
+    Returns a list of (x0, y0, x1, y1) tile boxes, ordered top-to-
+    bottom, left-to-right (an arbitrary but consistent search order -
+    see get_head_crop for why this order is a reasonable default).
+    """
+    x0, y0, x1, y1 = person_bbox
+    frame_h, frame_w = frame_shape
+
+    box_w, box_h = x1 - x0, y1 - y0
+    rows, cols = config.face_search_tile_grid
+    overlap = config.face_search_tile_overlap
+
+    tile_w = box_w / cols
+    tile_h = box_h / rows
+    pad_w = tile_w * overlap
+    pad_h = tile_h * overlap
+
+    tiles = []
+    for row in range(rows):
+        for col in range(cols):
+            tx0 = x0 + col * tile_w - pad_w
+            tx1 = x0 + (col + 1) * tile_w + pad_w
+            ty0 = y0 + row * tile_h - pad_h
+            ty1 = y0 + (row + 1) * tile_h + pad_h
+
+            tx0 = max(0, int(tx0))
+            ty0 = max(0, int(ty0))
+            tx1 = min(frame_w, int(tx1))
+            ty1 = min(frame_h, int(ty1))
+
+            if tx1 > tx0 and ty1 > ty0:
+                tiles.append((tx0, ty0, tx1, ty1))
+
+    return tiles
+
+
+def get_head_crop(
+    image_bgr: np.ndarray, sam2_mask: np.ndarray
+) -> tuple[np.ndarray, int, int, float, float] | None:
+    """
+    Searches the WHOLE person region (not an assumed head position)
+    for a face, by splitting the SAM2 mask's bounding box into an
+    overlapping grid of tiles, upscaling each one independently, and
+    trying face detection on each in turn until one succeeds. This
+    both solves the small/distant-face resolution problem (each tile
+    is upscaled the same way a single head-crop would be) AND makes no
+    assumption about where the head is - unlike a fixed "top X% of the
+    bbox" heuristic, which breaks down for arms-overhead poses (where
+    the topmost mask pixel is a hand, not the head) or lying-down
+    exercises (where "top" has no relationship to head position at
+    all).
+
+    Returns (local_oval_points, tile_x0, tile_y0, scale_x, scale_y)
+    for whichever tile a face was found in - local_oval_points are
+    already the detected face-oval landmarks, in that tile's local
+    pixel coordinates, so the caller doesn't need to re-run detection.
+    Map them to full-frame coordinates via:
+        full_x = tile_x0 + local_x / scale_x
+        full_y = tile_y0 + local_y / scale_y
+
+    Returns None if the mask is empty, or if no tile yields a
+    detected face.
+    """
+    ys, xs = np.nonzero(sam2_mask)
+    if len(xs) == 0:
+        return None
+
+    height, width = image_bgr.shape[:2]
+    person_bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+    tiles = _make_person_tiles(person_bbox, (height, width))
+
+    for tx0, ty0, tx1, ty1 in tiles:
+        crop = image_bgr[ty0:ty1, tx0:tx1]
+        crop_h, crop_w = crop.shape[:2]
+        if crop_h == 0 or crop_w == 0:
+            continue
+
+        # Upscale so the tile's longer side reaches the target size,
+        # giving the detector a "zoomed in" view of a face that would
+        # otherwise be too small/low-resolution in the full frame.
+        scale = config.head_crop_upscale_target / max(crop_h, crop_w)
+        scale = max(scale, 1.0)  # never downscale - only helps small tiles
+        new_size = (int(round(crop_w * scale)), int(round(crop_h * scale)))
+        crop_upscaled = cv.resize(crop, new_size, interpolation=cv.INTER_CUBIC)
+
+        # Each tile try doesn't count toward the per-frame hit-rate
+        # log on its own - only the overall per-frame outcome does,
+        # logged once by the caller (get_face_oval_mask).
+        local_points = detect_face_oval_points(crop_upscaled, count_attempt=False)
+        if local_points is not None:
+            return local_points, tx0, ty0, scale, scale
+
+    return None
+
+
+def _get_tracked_crop(
+    image_bgr: np.ndarray,
+) -> tuple[np.ndarray, int, int, float, float] | None:
+    """
+    If a CSRT tracker is active, asks it where the face box is this
+    frame, crops+upscales around that box, and tries landmark
+    detection there. This is the cheap path - skips the full tile-grid
+    search entirely when tracking is working.
+
+    Returns None (and resets tracker state) if there's no active
+    tracker, the tracker itself reports failure, or landmark detection
+    on the tracked region misses too many frames in a row (tracker
+    drift/lost target) - in all these cases the caller should fall
+    back to the full tile-grid search to re-acquire.
+    """
+    global _face_tracker, _face_tracker_miss_streak
+
+    if _face_tracker is None:
+        return None
+
+    height, width = image_bgr.shape[:2]
+    success, box = _face_tracker.update(image_bgr)
+    if not success:
+        _face_tracker = None
+        _face_tracker_miss_streak = 0
+        return None
+
+    bx, by, bw, bh = box
+    pad_x, pad_y = bw * 0.3, bh * 0.3
+    tx0 = max(0, int(bx - pad_x))
+    ty0 = max(0, int(by - pad_y))
+    tx1 = min(width, int(bx + bw + pad_x))
+    ty1 = min(height, int(by + bh + pad_y))
+
+    if tx1 <= tx0 or ty1 <= ty0:
+        _face_tracker = None
+        _face_tracker_miss_streak = 0
+        return None
+
+    crop = image_bgr[ty0:ty1, tx0:tx1]
+    crop_h, crop_w = crop.shape[:2]
+    scale = config.head_crop_upscale_target / max(crop_h, crop_w)
+    scale = max(scale, 1.0)
+    new_size = (int(round(crop_w * scale)), int(round(crop_h * scale)))
+    crop_upscaled = cv.resize(crop, new_size, interpolation=cv.INTER_CUBIC)
+
+    local_points = detect_face_oval_points(crop_upscaled, count_attempt=False)
+    if local_points is None:
+        _face_tracker_miss_streak += 1
+        if _face_tracker_miss_streak >= config.face_tracker_max_miss_streak:
+            _face_tracker = None
+            _face_tracker_miss_streak = 0
+        return None
+
+    _face_tracker_miss_streak = 0
+    return local_points, tx0, ty0, scale, scale
+
+
+def _seed_tracker(image_bgr: np.ndarray, oval_points: np.ndarray) -> None:
+    """
+    (Re-)initializes the CSRT tracker on the bounding box of a
+    just-detected face, so subsequent frames can use the cheap
+    tracked path instead of the full tile-grid search.
+    """
+    global _face_tracker, _face_tracker_miss_streak
+
+    x0, y0 = oval_points.min(axis=0)
+    x1, y1 = oval_points.max(axis=0)
+    # A little padding beyond the tight oval so the tracker has some
+    # surrounding context to lock onto, not just the face interior.
+    pad_x, pad_y = (x1 - x0) * 0.2, (y1 - y0) * 0.2
+    box = (
+        int(max(0, x0 - pad_x)),
+        int(max(0, y0 - pad_y)),
+        int((x1 - x0) + 2 * pad_x),
+        int((y1 - y0) + 2 * pad_y),
+    )
+
+    try:
+        tracker = _create_csrt_tracker()
+        tracker.init(image_bgr, box)
+        _face_tracker = tracker
+        _face_tracker_miss_streak = 0
+    except RuntimeError as e:
+        # No usable tracker API on this OpenCV install - log once and
+        # keep going without tracking (tile-grid search still runs
+        # every frame; just slower, not broken).
+        if config.use_face_tracking:
+            logger.warning(
+                "CSRT tracker unavailable (%s) - falling back to "
+                "full tile-grid search every frame. Set "
+                "config.use_face_tracking = False to silence this.",
+                e,
+            )
+
+
+def get_face_oval_mask(
+    image_bgr: np.ndarray, sam2_mask: np.ndarray | None = None
+) -> np.ndarray | None:
+    """
+    Detects a face and returns a filled (H, W) uint8 mask (255 inside
+    the face contour, 0 outside), built from MediaPipe's actual
+    face-oval landmark points via convex hull - not an approximated
+    ellipse or fixed-fraction box.
+
+    Detection tries three paths, cheapest first:
+      1. CSRT tracker (if one is active from a previous frame) - crop
+         around wherever the tracker says the face is, no tile search.
+      2. Full tile-grid search over the whole SAM2-masked person
+         region (see get_head_crop) - pose-robust, more expensive.
+      3. Full-frame detection with no cropping at all, if sam2_mask
+         wasn't provided.
+    Whenever (2) succeeds, the tracker is (re-)seeded from that result
+    so later frames can use the cheap path (1) again.
+
+    Returns None if no face is found this frame (person facing away,
+    steep angle, etc.) - callers should treat that as "nothing to
+    flatten this frame", not an error.
+    """
+    global _face_detect_attempts, _face_detect_hits
+
+    height, width = image_bgr.shape[:2]
+
+    crop_info = None
+    used_tracker = False
+    if config.use_face_tracking:
+        crop_info = _get_tracked_crop(image_bgr)
+        used_tracker = crop_info is not None
+
+    if crop_info is None and sam2_mask is not None:
+        crop_info = get_head_crop(image_bgr, sam2_mask)
+
+    if crop_info is not None:
+        local_points, crop_x0, crop_y0, scale_x, scale_y = crop_info
+        oval_points = np.empty_like(local_points)
+        oval_points[:, 0] = crop_x0 + local_points[:, 0] / scale_x
+        oval_points[:, 1] = crop_y0 + local_points[:, 1] / scale_y
+        # Both paths already ran detection with count_attempt=False -
+        # count this frame as a single hit here instead.
+        _face_detect_attempts += 1
+        _face_detect_hits += 1
+
+        if config.use_face_tracking and not used_tracker:
+            # Tile search (re-)acquired a face - seed/refresh the
+            # tracker so subsequent frames can use the cheap path.
+            _seed_tracker(image_bgr, oval_points)
+    else:
+        oval_points = detect_face_oval_points(image_bgr)
+        if oval_points is None:
+            return None
+
+    hull = cv.convexHull(oval_points).astype(np.int32)
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv.fillConvexPoly(mask, hull, 255)
+    return mask
+
+
+def log_face_detection_summary() -> None:
+    """
+    Call once after processing a whole video to report how often face
+    detection actually succeeded. If hits is 0 (or very low relative
+    to attempts), the flattening effect isn't visibly doing anything
+    not because the flattening logic is wrong, but because the model
+    isn't finding a face in this footage at the configured confidence
+    - that's a detection problem, not a rendering problem, and no
+    per-frame warning would otherwise surface it.
+    """
+    if _face_detect_attempts == 0:
+        return
+    logger.info(
+        f"Face detection: {_face_detect_hits}/{_face_detect_attempts} frames "
+        f"had a face detected (confidence >= {config.face_detection_confidence})."
+    )
+    if _face_detect_hits == 0:
+        logger.warning(
+            "Face was never detected in any frame - face flattening had no "
+            "effect on this video. Try lowering config.face_detection_confidence "
+            "(currently %.2f), increasing config.head_crop_upscale_target, or "
+            "check that the face is reasonably visible/front-facing in this "
+            "footage.",
+            config.face_detection_confidence,
+        )
+
+
+def flatten_face_region(image_bgr: np.ndarray, sam2_mask: np.ndarray | None = None) -> np.ndarray:
+    """
+    Replaces the face-oval region of the frame with a single flat
+    color (the mean color sampled from that same region), feathering
+    the mask edge so the transition isn't a hard boundary. Operates
+    on the source frame itself, before any edge detection runs, so
+    there is zero internal gradient there - guaranteed, since a flat
+    fill has no edges by construction, unlike relying on a blur being
+    "strong enough".
+
+    sam2_mask, if provided, is used to crop+upscale just the head
+    region before running face detection (see get_head_crop) - this
+    is what makes a small/distant face detectable at all on typical
+    full-body exercise footage, rather than relying on a "long range"
+    detection model.
+
+    If no face is detected this frame, returns image_bgr unchanged.
+    """
+    mask = get_face_oval_mask(image_bgr, sam2_mask)
+    if mask is None:
+        return image_bgr
+
+    mean_color = cv.mean(image_bgr, mask=mask)[:3]  # BGR mean over the masked region
+    flat_fill = np.full_like(image_bgr, mean_color, dtype=np.uint8)
+
+    # Feather the hard convex-hull mask edge with a wide Gaussian blur
+    # on the mask itself, so the transition to the flat fill fades
+    # smoothly rather than cutting off sharply at the hull boundary.
+    feather_ksize = config.face_blur_feather_ksize
+    mask_feathered = cv.GaussianBlur(mask, feather_ksize, 0).astype(np.float32) / 255.0
+    mask_feathered = mask_feathered[:, :, np.newaxis]
+
+    blended = (
+        flat_fill.astype(np.float32) * mask_feathered
+        + image_bgr.astype(np.float32) * (1.0 - mask_feathered)
+    )
+    return blended.astype(np.uint8)
+
+
+# ============================================================
 # EDGE PIPELINE
 # ============================================================
 
@@ -43,6 +538,9 @@ def edge_detect(image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray
     on the full frame (so gradients at the mask boundary are accurate),
     but the result is zeroed outside the mask afterward.
     """
+    if config.use_face_blur:
+        image = flatten_face_region(image, sam2_mask=mask)
+
     gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
 
     if config.use_clahe:
@@ -233,6 +731,9 @@ def process_video(input_path: str, output_path: str) -> None:
     progress.close()
     writer.release()
     video.release()
+
+    if config.use_face_blur:
+        log_face_detection_summary()
 
     logger.info(f"Video written to: {output_path}")
 
