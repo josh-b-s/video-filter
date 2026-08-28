@@ -1,0 +1,11 @@
+opencv-contrib-python
+numpy
+tqdm
+mediapipe
+torch
+torchvision
+timm
+PySide6
+pyinstaller
+# EdgeTAM installed separately, see README.md:
+#   git clone https://github.com/facebookresearch/EdgeTAM.git && cd EdgeTAM && pip install -e .

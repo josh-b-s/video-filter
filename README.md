@@ -1,61 +1,74 @@
-# video edge detection
+# Edge-art video pipeline
 
-Use opencv-python library to detect the edge of anime video.
+Restructured for one-responsibility-per-file, plus a GUI for
+non-technical people to pick SAM2 prompt points per video and queue
+them for background processing.
 
-## environment
-- Python 3.7+
+## Layout
 
-## setup
-install dependencies:
 ```
-pip install -r requirement_dev.txt
+config.py                  global settings (edit this for defaults)
+core/
+  job_store.py              per-video points/face-toggle/status, in video_jobs.json
+  face_flatten.py           face detection + flattening only
+  edges.py                  edge_detect() + recolor() only
+  video_io.py                FPS resampling, chunk concatenation, frame reads
+  sam2_segment.py           SAM2/EdgeTAM video + single-image mask prediction
+  pipeline.py                orchestrates the above for one video (SAM2 -> chunks -> stitch)
+gui/
+  point_picker.py           the clickable canvas widget + live mask preview
+  queue_worker.py           background QThread that processes the queue
+  main_window.py            wires video list + canvas + queue together
+app.py                      GUI entry point
+process_queue_cli.py        headless: process already-picked videos, no GUI
+tools/tune_edges.py         optional advanced slider tuner (python -m tools.tune_edges <file>)
 ```
 
-## usage
+## Normal workflow (GUI)
 
-edit `canny.py` options as follows:
-```python
-# =======================API params(用户参数)=======================
-# 高斯模糊的核大小，必须为 (3,3) 或 (5,5) 或(7,7)
-gaussian_ksize = (3, 3)
-# 输出视频的背景颜色，RGB 格式，必须为数组格式
-bg_color_rgb = [237, 244, 247]
-# 输出视频的线条颜色，RGB 格式，必须为数组格式
-line_color_rgb = [173, 155, 236]
-# canny 低阈值
-canny_low_threshold = 30
-# canny 高阈值，一般为低阈值的 2 或 3 倍
-canny_high_threshold = 90
-# 形态学膨胀核，修复 canny 边缘检测后的线条太细的问题, 核越大，线条越粗。
-dilation_ksize = (2, 2)
-# 输入视频的路径
-input_video_path = "materials/videos/2007-autumn-anime-spot-op.mp4"
-# 输出视频的文件夹，手动创建保证存在
-output_folder = "output"
-# ================================================================
 ```
-Then run command:
-```bash
-python canny.py
+python app.py
 ```
-If all goes well without errors, you can see three files are generated in `output_folder`, similar to the following:
+
+1. Choose the folder of videos.
+2. For each video: click fg/bg points on the person, toggle "Remove
+   face" (on by default), click **Confirm & Queue → Next video**.
+3. That video starts processing in the background immediately while
+   you keep picking the next one.
+4. Outputs land in `output/`.
+
+Picked points and per-video settings persist to `video_jobs.json` next
+to `config.py`, so closing and reopening the app resumes where you
+left off (anything left "queued"/"processing" from a previous session
+is automatically re-queued on startup).
+
+## Packaging as a standalone .exe
+
+See `build_exe.md`.
+
+## Headless / render-box use
+
+If someone already picked points via the GUI and you just need to run
+the actual processing on a separate (faster/GPU) machine, copy the
+video folder + `video_jobs.json` over and run:
+
 ```
-- 2007-autumn-anime-spot-op-[canny]-[add-audio].mp4
-- 2007-autumn-anime-spot-op-[canny].mp4
-- 2007-autumn-anime-spot-op.wav
+python process_queue_cli.py
 ```
-The `2007-autumn-anime-spot-op-[canny]-[add-audio].mp4` is the final output result.
 
-## documents
+## What changed from the old single-file scripts
 
-Some related documents are located in `docs` folder:
-
-- [edge-detect-quality](docs/edge-detect-quality.md): how to increase canny detect quality.
-- [opencv-get-started-notes.md](docs/opencv-get-started-notes.md): some basic opencv knowledge.
-
-## LICENSE
-
-Mixed LICENSE
-
-- All codes except (`reimplement_canny.py`) are under MIT LICENSE.
-- `reimplement_canny.py` is under `No License` components due to the absence of LICENSE in [scatter-animation-for-ikun](https://github.com/GBL-123/scatter-animation-for-ikun).
+- `canny.py` split into `core/face_flatten.py`, `core/edges.py`,
+  `core/video_io.py`, `core/pipeline.py`.
+- `sam2_segment.py` moved into `core/`, plus a small single-image
+  prediction helper added for the GUI's live preview.
+- `pick_prompt_points.py` and `test_sam2.py` are superseded by the GUI
+  (`gui/point_picker.py` does live-preview point picking; queued jobs
+  get processed automatically, so there's no separate "preview mask on
+  N sample frames" step - you see the live mask while picking instead).
+- `config.prompt_points_path` (one video at a time) replaced by
+  `core/job_store.py` (one entry per video, so a whole folder can be
+  picked and queued without overwriting each other).
+- `use_face_blur` is no longer a single global switch - it's a
+  per-video toggle in the job store, defaulting to
+  `config.use_face_blur_default` (on).
