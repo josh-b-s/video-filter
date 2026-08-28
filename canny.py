@@ -1,5 +1,6 @@
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2 as cv
@@ -7,7 +8,17 @@ import numpy as np
 from tqdm import tqdm
 
 import config
-from sam2_segment import Sam2Segmenter, build_config_from_settings
+# NOTE: sam2_segment (and therefore torch/CUDA) is intentionally NOT
+# imported at module level - it's imported lazily, only inside the
+# one code path that needs it (the SAM2 pass in process_video, which
+# always runs in the main process). Worker processes spawned for the
+# chunked edge-detection pass re-import this whole module from
+# scratch (multiprocessing on Windows uses 'spawn'), so a top-level
+# import here would mean every worker also loads torch's full CUDA
+# DLL stack for no reason - workers never call anything SAM2-related.
+# With enough workers running simultaneously, that's enough
+# concurrent CUDA DLL loading to exhaust the system paging file
+# (WinError 1455) even though none of them actually use the GPU.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -670,67 +681,256 @@ def recolor(edge_image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarra
 
 
 # ============================================================
-# PROCESS VIDEO
+# FPS RESAMPLING
 # ============================================================
 
-def process_video(input_path: str, output_path: str) -> None:
-    make_sure_file_exists(input_path)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+def resample_video_to_fps(input_path: str, target_fps: float, output_dir: str) -> str:
+    """
+    Writes a frame-dropped copy of input_path at target_fps and
+    returns its path. Frames are dropped using an accumulator (not a
+    naive "every Nth frame") so drops are spread evenly across the
+    clip rather than drifting - matters when original_fps/target_fps
+    isn't a whole number (e.g. 25 -> 15 is a 1.667x ratio).
 
+    This becomes the actual input to the rest of the pipeline (SAM2 +
+    edge detection both run on the reduced frame count), which is
+    where the speedup comes from - not just fewer frames written at
+    the end.
+
+    If target_fps >= the source's actual fps, returns input_path
+    unchanged (nothing to drop, avoid a pointless re-encode pass).
+    """
     video = cv.VideoCapture(input_path)
     if not video.isOpened():
         raise RuntimeError(f"Could not open video: {input_path}")
 
     width = int(video.get(cv.CAP_PROP_FRAME_WIDTH))
     height = int(video.get(cv.CAP_PROP_FRAME_HEIGHT))
+    source_fps = float(video.get(cv.CAP_PROP_FPS))
+    total_frames = int(video.get(cv.CAP_PROP_FRAME_COUNT))
+
+    if target_fps >= source_fps:
+        video.release()
+        logger.info(
+            f"target_fps ({target_fps}) >= source fps ({source_fps}) - "
+            f"skipping FPS resampling, using original video as-is."
+        )
+        return input_path
+
+    os.makedirs(output_dir, exist_ok=True)
+    filename_noext = Path(input_path).stem
+    output_path = os.path.join(output_dir, f"{filename_noext}-{target_fps:g}fps.mp4")
+
+    fourcc = cv.VideoWriter_fourcc(*"mp4v")
+    writer = cv.VideoWriter(output_path, fourcc, target_fps, (width, height), True)
+    if not writer.isOpened():
+        video.release()
+        raise RuntimeError(f"Could not create resampled video: {output_path}")
+
+    # Bresenham-style accumulator: advance by target_fps each source
+    # frame, emit a frame and subtract source_fps whenever the
+    # accumulator has crossed a full source_fps "tick" - spreads
+    # drops evenly rather than concentrating rounding error.
+    accumulator = 0.0
+    written = 0
+
+    progress = tqdm(total=total_frames, desc="Resampling FPS...")
+    while True:
+        success, frame = video.read()
+        if not success:
+            break
+
+        accumulator += target_fps
+        if accumulator >= source_fps:
+            accumulator -= source_fps
+            writer.write(frame)
+            written += 1
+
+        progress.update(1)
+
+    progress.close()
+    writer.release()
+    video.release()
+
+    logger.info(
+        f"Resampled {total_frames} frames at {source_fps:.2f}fps down to "
+        f"{written} frames at {target_fps:g}fps -> {output_path}"
+    )
+    return output_path
+
+
+# ============================================================
+# PROCESS VIDEO
+# ============================================================
+
+def _process_frame_range(
+    video_path: str,
+    start_frame: int,
+    end_frame: int,
+    masks: list[np.ndarray | None],
+    output_path: str,
+    width: int,
+    height: int,
+    fps: float,
+) -> str:
+    """
+    Worker function: processes frames [start_frame, end_frame) of
+    video_path (edge_detect + recolor, using the corresponding
+    pre-computed SAM2 masks) and writes them to their own chunk video
+    file at output_path. Returns output_path so the caller can
+    concatenate chunks back together in order.
+
+    Runs as its own process (see process_video) - each worker gets
+    fresh module-level state (face landmarker, CSRT tracker, etc.)
+    since Python's multiprocessing re-imports this module per process;
+    nothing needs to be explicitly reset for that reason. This does
+    mean each chunk pays its own face re-acquisition cost at the start
+    (the tracker doesn't carry over from the previous chunk) - a small,
+    one-time cost per chunk, not per frame.
+
+    Must be a module-level function (not a nested closure/lambda) so
+    it can be pickled for multiprocessing on Windows, which uses the
+    'spawn' start method.
+    """
+    video = cv.VideoCapture(video_path)
+    video.set(cv.CAP_PROP_POS_FRAMES, start_frame)
+
+    fourcc = cv.VideoWriter_fourcc(*"mp4v")
+    writer = cv.VideoWriter(output_path, fourcc, fps, (width, height), True)
+
+    for i in tqdm(range(end_frame - start_frame), desc=f"Frames {start_frame}-{end_frame}"):
+        success, frame = video.read()
+        if not success:
+            break
+
+        mask = masks[i]
+        edges = edge_detect(frame, mask=mask)
+        output_frame = recolor(edges, mask=mask)
+        writer.write(output_frame)
+
+    writer.release()
+    video.release()
+    return output_path
+
+
+def _concatenate_chunks(chunk_paths: list[str], output_path: str, fps: float, width: int, height: int) -> None:
+    """
+    Re-encodes a sequence of chunk video files, in order, into a
+    single final output file. Done via OpenCV (read-then-rewrite)
+    rather than shelling out to ffmpeg, to avoid adding a new external
+    binary dependency to the project.
+    """
+    fourcc = cv.VideoWriter_fourcc(*"mp4v")
+    writer = cv.VideoWriter(output_path, fourcc, fps, (width, height), True)
+
+    for chunk_path in chunk_paths:
+        chunk_video = cv.VideoCapture(chunk_path)
+        while True:
+            success, frame = chunk_video.read()
+            if not success:
+                break
+            writer.write(frame)
+        chunk_video.release()
+
+    writer.release()
+
+
+def process_video(input_path: str, output_path: str) -> None:
+    make_sure_file_exists(input_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # --- Optional FPS reduction. This becomes the actual input to
+    # everything below - SAM2 and edge detection both process fewer
+    # frames as a result, not just the final written video.
+    working_input_path = input_path
+    if config.target_fps is not None:
+        working_input_path = resample_video_to_fps(
+            input_path, config.target_fps, config.resampled_video_dir
+        )
+
+    video = cv.VideoCapture(working_input_path)
+    if not video.isOpened():
+        raise RuntimeError(f"Could not open video: {working_input_path}")
+
+    width = int(video.get(cv.CAP_PROP_FRAME_WIDTH))
+    height = int(video.get(cv.CAP_PROP_FRAME_HEIGHT))
     fps = float(video.get(cv.CAP_PROP_FPS))
     total_frames = int(video.get(cv.CAP_PROP_FRAME_COUNT))
+    video.release()
 
     logger.info(
         f"width: {width}; height: {height}; fps: {fps}; total_frames: {total_frames}."
     )
 
-    fourcc = cv.VideoWriter_fourcc(*"mp4v")
-    writer = cv.VideoWriter(output_path, fourcc, fps, (width, height), True)
-
-    if not writer.isOpened():
-        video.release()
-        raise RuntimeError(f"Could not create output video: {output_path}")
-
     # --- SAM2 segmentation runs first, as its own pass over the whole
-    # video, and is completely decoupled from the edge-detection loop
-    # below. mask_iter is None when disabled, so the frame loop doesn't
-    # need to branch on use_sam2 at all.
-    mask_iter = None
+    # video - this is an inherently sequential pass (each frame's mask
+    # depends on the model's running memory of previous frames), so it
+    # cannot itself be chunked/parallelized the way the edge-detection
+    # step below can. Masks are fully materialized into a list (not
+    # left as a generator) so they can be sliced per-chunk.
+    masks: list[np.ndarray | None] = [None] * total_frames
     if config.use_sam2:
+        # Imported here (not at module top) so worker processes never
+        # load torch/CUDA - see the note at the top of this file.
+        from sam2_segment import Sam2Segmenter, build_config_from_settings
+
         logger.info("Running SAM2 segmentation pass...")
         segmenter = Sam2Segmenter(build_config_from_settings())
-        segmenter.prepare_frames(input_path)
+        segmenter.prepare_frames(working_input_path)
         if segmenter._num_frames != total_frames:
             raise RuntimeError(
                 f"SAM2 extracted {segmenter._num_frames} frames but the video has "
                 f"{total_frames} frames according to VideoCapture - these should always "
                 f"match. Try deleting {config.sam2_frame_extraction_dir} and rerunning."
             )
-        mask_iter = segmenter.propagate_masks()
+        masks = list(tqdm(segmenter.propagate_masks(), total=total_frames, desc="Propagating masks..."))
 
-    progress = tqdm(total=total_frames, desc="Processing frame...")
+    if not config.use_multiprocessing or config.num_worker_processes == 1:
+        # Single-process path - same as chunking with exactly one
+        # chunk covering the whole video, but skips the pool/temp-file
+        # machinery entirely. Useful for debugging face-detection
+        # changes, where per-process log output interleaving from a
+        # pool makes things harder to read.
+        chunk_path = _process_frame_range(
+            working_input_path, 0, total_frames, masks, output_path, width, height, fps
+        )
+    else:
+        num_workers = config.num_worker_processes or min(os.cpu_count() or 1, 6)
+        num_workers = min(num_workers, max(1, total_frames))
 
-    while True:
-        success, frame = video.read()
-        if not success:
-            break
+        chunk_boundaries = np.linspace(0, total_frames, num_workers + 1, dtype=int)
+        os.makedirs(config.chunk_output_dir, exist_ok=True)
 
-        mask = next(mask_iter) if mask_iter is not None else None
+        chunk_args = []
+        for i in range(num_workers):
+            start, end = int(chunk_boundaries[i]), int(chunk_boundaries[i + 1])
+            if end <= start:
+                continue
+            chunk_output_path = os.path.join(config.chunk_output_dir, f"chunk_{i:03d}.mp4")
+            chunk_args.append((
+                working_input_path, start, end, masks[start:end],
+                chunk_output_path, width, height, fps,
+            ))
 
-        edges = edge_detect(frame, mask=mask)
-        output_frame = recolor(edges, mask=mask)
-        writer.write(output_frame)
-        progress.update(1)
+        logger.info(f"Processing {total_frames} frames across {len(chunk_args)} worker processes...")
 
-    progress.close()
-    writer.release()
-    video.release()
+        with ProcessPoolExecutor(max_workers=len(chunk_args)) as executor:
+            futures = [executor.submit(_process_frame_range, *args) for args in chunk_args]
+            chunk_paths = []
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing chunks..."):
+                chunk_paths.append(future.result())
+
+        # as_completed() doesn't preserve submission order - futures
+        # already carry their own paths, so sort chunk_paths back into
+        # frame order via the chunk index encoded in the filename
+        # rather than trusting completion order.
+        chunk_paths.sort()
+
+        logger.info("Concatenating chunks into final output...")
+        _concatenate_chunks(chunk_paths, output_path, fps, width, height)
+
+        for chunk_path in chunk_paths:
+            os.remove(chunk_path)
 
     if config.use_face_blur:
         log_face_detection_summary()

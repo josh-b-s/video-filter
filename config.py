@@ -25,6 +25,48 @@ prompt_points_path = "prompt_points.json"
 
 
 # ============================================================
+# PERFORMANCE
+# ============================================================
+
+# Drops frames down to this FPS before anything else runs (SAM2 +
+# edge detection both process the reduced frame count, not just the
+# final output) - set to None to keep the source video's original
+# FPS untouched. Frame drops are spread evenly (not "every Nth
+# frame"), so this works cleanly even when source_fps/target_fps
+# isn't a whole number. Given the flat-silhouette art style, a lower
+# FPS (e.g. 15) costs little perceptually - classic limited animation
+# is often shot on 2s exposure for exactly this reason - while roughly
+# halving total processing time.
+target_fps = 24
+resampled_video_dir = "output/_resampled"
+
+# Splits the (post-FPS-reduction) frame range into this many
+# contiguous chunks, each processed in its own worker process in
+# parallel - the per-frame edge-detection/face-blur/recolor work is
+# independent per chunk, unlike SAM2's mask propagation, which is
+# inherently sequential and always runs as a single pass regardless
+# of this setting. None/0 uses min(os.cpu_count(), 6) rather than the
+# raw core count - each worker independently loads OpenCV + MediaPipe
+# (not torch/CUDA, which is deliberately kept out of worker processes
+# entirely - see the note at the top of canny.py), and spawning as
+# many processes as you have cores at once can still be more
+# simultaneous DLL-loading/memory pressure than it's worth on a short
+# clip. Raise this explicitly if you have headroom and a long clip
+# where more parallelism pays off. Set use_multiprocessing = False (or
+# num_worker_processes = 1) to run everything in a single process
+# instead - useful when debugging, since per-process log output from a
+# pool can interleave and be harder to read.
+#
+# Each chunk pays its own face-tracker re-acquisition cost at the
+# start (tracking state doesn't carry across chunk boundaries) - a
+# small one-time cost per chunk, not per frame, so this is a good
+# trade for clips long enough to benefit from parallelism.
+use_multiprocessing = True
+num_worker_processes = None
+chunk_output_dir = "output/_chunks"
+
+
+# ============================================================
 # COLOR SCHEME
 # ============================================================
 
