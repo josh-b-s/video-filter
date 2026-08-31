@@ -19,6 +19,7 @@ output_folder = "output"
 sam2_frame_extraction_dir = "output/_sam2_frames"
 sam2_test_preview_dir = "output/_sam2_test"
 chunk_output_dir = "output/_chunks"
+trimmed_video_dir = "output/_trimmed"
 resampled_video_dir = "output/_resampled"
 job_store_path = "video_jobs.json"     # per-video points + toggles, saved by the GUI
 

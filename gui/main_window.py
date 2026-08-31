@@ -13,12 +13,13 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QListWidget,
     QListWidgetItem, QPushButton, QCheckBox, QLabel, QPlainTextEdit,
-    QFileDialog, QSplitter, QMessageBox,
+    QFileDialog, QSplitter, QMessageBox, QTabWidget,
 )
 
 import config
 from core import job_store, video_io
 from gui.point_picker import PointPickerCanvas
+from gui.crop_trim_picker import CropTrimCanvas
 from gui.queue_worker import QueueWorker
 
 logger = logging.getLogger(__name__)
@@ -80,12 +81,19 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.video_list, 1)
         splitter.addWidget(left)
 
-        # middle: picker canvas + controls
+        # middle: tabbed picker (points / crop+trim) + shared controls
         middle = QWidget()
         middle_layout = QVBoxLayout(middle)
+
+        self.tabs = QTabWidget()
+        middle_layout.addWidget(self.tabs, 1)
+
+        # -- Points tab --
+        points_tab = QWidget()
+        points_layout = QVBoxLayout(points_tab)
         self.canvas = PointPickerCanvas()
         self.canvas.mask_error.connect(lambda msg: self._log(f"SAM2 mask preview error:\n{msg}"))
-        middle_layout.addWidget(self.canvas, 1)
+        points_layout.addWidget(self.canvas, 1)
 
         help_label = QLabel(
             "Left click = keep this region (foreground)   |   "
@@ -94,20 +102,49 @@ class MainWindow(QMainWindow):
             "so the whole person is selected."
         )
         help_label.setWordWrap(True)
-        middle_layout.addWidget(help_label)
+        points_layout.addWidget(help_label)
 
+        points_controls_row = QHBoxLayout()
+        undo_btn = QPushButton("Undo point")
+        undo_btn.clicked.connect(self.canvas.undo_point)
+        points_controls_row.addWidget(undo_btn)
+
+        clear_btn = QPushButton("Clear points")
+        clear_btn.clicked.connect(self.canvas.clear_points)
+        points_controls_row.addWidget(clear_btn)
+        points_controls_row.addStretch(1)
+        points_layout.addLayout(points_controls_row)
+
+        self.tabs.addTab(points_tab, "Points")
+
+        # -- Crop / Trim tab --
+        crop_tab = QWidget()
+        crop_layout = QVBoxLayout(crop_tab)
+        self.crop_trim_canvas = CropTrimCanvas()
+        crop_layout.addWidget(self.crop_trim_canvas, 1)
+
+        crop_help_label = QLabel(
+            "Drag a rectangle on the frame to crop (redrag to change it). "
+            "Use the sliders to set the trim start/end frame - the preview "
+            "frame updates as you scrub."
+        )
+        crop_help_label.setWordWrap(True)
+        crop_layout.addWidget(crop_help_label)
+
+        crop_controls_row = QHBoxLayout()
+        reset_crop_btn = QPushButton("Reset crop (use full frame)")
+        reset_crop_btn.clicked.connect(self.crop_trim_canvas.reset_crop)
+        crop_controls_row.addWidget(reset_crop_btn)
+        crop_controls_row.addStretch(1)
+        crop_layout.addLayout(crop_controls_row)
+
+        self.tabs.addTab(crop_tab, "Crop / Trim")
+
+        # -- Shared controls (face toggle + confirm), below the tabs --
         controls_row = QHBoxLayout()
         self.face_checkbox = QCheckBox("Remove face")
         self.face_checkbox.setChecked(config.use_face_blur_default)
         controls_row.addWidget(self.face_checkbox)
-
-        undo_btn = QPushButton("Undo point")
-        undo_btn.clicked.connect(self.canvas.undo_point)
-        controls_row.addWidget(undo_btn)
-
-        clear_btn = QPushButton("Clear points")
-        clear_btn.clicked.connect(self.canvas.clear_points)
-        controls_row.addWidget(clear_btn)
 
         controls_row.addStretch(1)
 
@@ -199,6 +236,12 @@ class MainWindow(QMainWindow):
             self.canvas._redraw()
         self.face_checkbox.setChecked(job.use_face_blur)
 
+        try:
+            self.crop_trim_canvas.load_video(path)
+            self.crop_trim_canvas.set_job_values(job.crop_rect, job.trim_start_frame, job.trim_end_frame)
+        except Exception as e:
+            self._log(f"Could not load {filename} for crop/trim: {e}")
+
     # ------------------------------------------------------------
     def _confirm_and_next(self) -> None:
         if self.current_filename is None:
@@ -213,6 +256,9 @@ class MainWindow(QMainWindow):
             prompt_points=list(self.canvas.points),
             prompt_labels=list(self.canvas.labels),
             use_face_blur=self.face_checkbox.isChecked(),
+            crop_rect=self.crop_trim_canvas.crop_rect,
+            trim_start_frame=self.crop_trim_canvas.trim_start_frame,
+            trim_end_frame=self.crop_trim_canvas.trim_end_frame,
             status="queued",
         )
         job_store.save_job(job)

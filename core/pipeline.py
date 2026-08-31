@@ -68,16 +68,38 @@ def _process_frame_range(
     return output_path
 
 
-def process_video(input_path: str, output_path: str, prompt_points: list, prompt_labels: list, use_face_blur: bool) -> None:
+def process_video(
+    input_path: str,
+    output_path: str,
+    prompt_points: list,
+    prompt_labels: list,
+    use_face_blur: bool,
+    crop_rect: tuple[int, int, int, int] | None = None,
+    trim_start_frame: int = 0,
+    trim_end_frame: int | None = None,
+) -> None:
     """
     Runs the full pipeline for one video using its own already-picked
-    prompt points and face-removal toggle (from job_store) - does not
-    touch or depend on any other video's state.
+    prompt points, face-removal toggle, and crop/trim range (from
+    job_store) - does not touch or depend on any other video's state.
     """
     make_sure_file_exists(input_path)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     working_input_path = input_path
+
+    # Trim + crop run first, before FPS resampling - this cuts frame
+    # count and resolution before SAM2, edge detection, or the resample
+    # step ever touch the video, so it's a speedup as well as a
+    # convenience. trim_start/end_frame are indices into the ORIGINAL
+    # video, which is why this has to happen before resampling shifts
+    # what's at each index.
+    if crop_rect is not None or trim_start_frame or trim_end_frame is not None:
+        working_input_path = video_io.trim_and_crop_video(
+            working_input_path, trim_start_frame, trim_end_frame, crop_rect,
+            config.trimmed_video_dir,
+        )
+
     if config.target_fps is not None:
         working_input_path = video_io.resample_video_to_fps(input_path, config.target_fps, config.resampled_video_dir)
 
@@ -164,5 +186,8 @@ def process_job(video_path: str, job) -> str:
     """Convenience wrapper the GUI/CLI call with a job_store.VideoJob."""
     filename_noext = Path(video_path).stem
     output_path = os.path.join(config.output_folder, f"{filename_noext}.mp4")
-    process_video(video_path, output_path, job.prompt_points, job.prompt_labels, job.use_face_blur)
+    process_video(
+        video_path, output_path, job.prompt_points, job.prompt_labels, job.use_face_blur,
+        crop_rect=job.crop_rect, trim_start_frame=job.trim_start_frame, trim_end_frame=job.trim_end_frame,
+    )
     return output_path

@@ -30,6 +30,13 @@ class VideoJob:
     prompt_points: list[tuple[int, int]] = field(default_factory=list)
     prompt_labels: list[int] = field(default_factory=list)
     use_face_blur: bool = config.use_face_blur_default
+    # Crop rectangle in the ORIGINAL video's pixel coordinates
+    # (x1, y1, x2, y2). None = no cropping, use the full frame.
+    crop_rect: tuple[int, int, int, int] | None = None
+    # Trim range in ORIGINAL (pre-resample) frame indices, [start, end).
+    # trim_end_frame=None means "to the end of the clip".
+    trim_start_frame: int = 0
+    trim_end_frame: int | None = None
     status: JobStatus = "unpicked"
     error_message: str | None = None
 
@@ -57,11 +64,15 @@ def load_all() -> dict[str, VideoJob]:
         raw = _load_raw()
     jobs = {}
     for filename, entry in raw.items():
+        crop_rect = entry.get("crop_rect")
         jobs[filename] = VideoJob(
             filename=filename,
             prompt_points=[tuple(p) for p in entry.get("prompt_points", [])],
             prompt_labels=entry.get("prompt_labels", []),
             use_face_blur=entry.get("use_face_blur", config.use_face_blur_default),
+            crop_rect=tuple(crop_rect) if crop_rect else None,
+            trim_start_frame=entry.get("trim_start_frame", 0),
+            trim_end_frame=entry.get("trim_end_frame"),
             status=entry.get("status", "unpicked"),
             error_message=entry.get("error_message"),
         )
