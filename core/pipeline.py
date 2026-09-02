@@ -74,6 +74,7 @@ def process_video(
     prompt_points: list,
     prompt_labels: list,
     use_face_blur: bool,
+    use_sam2: bool = True,
     crop_rect: tuple[int, int, int, int] | None = None,
     trim_start_frame: int = 0,
     trim_end_frame: int | None = None,
@@ -101,14 +102,14 @@ def process_video(
         )
 
     if config.target_fps is not None:
-        working_input_path = video_io.resample_video_to_fps(input_path, config.target_fps, config.resampled_video_dir)
+        working_input_path = video_io.resample_video_to_fps(working_input_path, config.target_fps, config.resampled_video_dir)
 
     info = video_io.get_video_info(working_input_path)
     width, height, fps, total_frames = info["width"], info["height"], info["fps"], info["total_frames"]
     logger.info(f"width: {width}; height: {height}; fps: {fps}; total_frames: {total_frames}.")
 
     masks: list = [None] * total_frames
-    if config.use_sam2:
+    if use_sam2:
         from core.sam2_segment import Sam2Segmenter, build_config_for_video
 
         logger.info("Running SAM2 segmentation pass...")
@@ -120,6 +121,8 @@ def process_video(
                 f"{total_frames} frames - these should always match."
             )
         masks = list(tqdm(segmenter.propagate_masks(), total=total_frames, desc="Propagating masks..."))
+    else:
+        logger.info("use_sam2 is off for this video - skipping segmentation, no mask applied.")
 
     chunk_dir = os.path.join(config.chunk_output_dir, Path(input_path).stem)
 
@@ -188,6 +191,7 @@ def process_job(video_path: str, job) -> str:
     output_path = os.path.join(config.output_folder, f"{filename_noext}.mp4")
     process_video(
         video_path, output_path, job.prompt_points, job.prompt_labels, job.use_face_blur,
+        use_sam2=job.use_sam2,
         crop_rect=job.crop_rect, trim_start_frame=job.trim_start_frame, trim_end_frame=job.trim_end_frame,
     )
     return output_path

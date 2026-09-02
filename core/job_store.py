@@ -30,6 +30,7 @@ class VideoJob:
     prompt_points: list[tuple[int, int]] = field(default_factory=list)
     prompt_labels: list[int] = field(default_factory=list)
     use_face_blur: bool = config.use_face_blur_default
+    use_sam2: bool = config.use_sam2
     # Crop rectangle in the ORIGINAL video's pixel coordinates
     # (x1, y1, x2, y2). None = no cropping, use the full frame.
     crop_rect: tuple[int, int, int, int] | None = None
@@ -70,6 +71,7 @@ def load_all() -> dict[str, VideoJob]:
             prompt_points=[tuple(p) for p in entry.get("prompt_points", [])],
             prompt_labels=entry.get("prompt_labels", []),
             use_face_blur=entry.get("use_face_blur", config.use_face_blur_default),
+            use_sam2=entry.get("use_sam2", config.use_sam2),
             crop_rect=tuple(crop_rect) if crop_rect else None,
             trim_start_frame=entry.get("trim_start_frame", 0),
             trim_end_frame=entry.get("trim_end_frame"),

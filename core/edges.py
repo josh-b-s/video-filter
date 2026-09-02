@@ -93,7 +93,12 @@ def recolor(edge_image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarra
         outline_mask = None
         if config.sam2_outline_thickness > 0:
             mask_u8 = (mask.astype(np.uint8)) * 255
-            contours, _ = cv.findContours(mask_u8, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+            # RETR_EXTERNAL would only return the outermost contour and
+            # silently drop any hole in the mask (e.g. the gap between
+            # an arm and the torso) - RETR_CCOMP returns holes as their
+            # own contours too, so they get outlined at the same
+            # thickness as the outer boundary instead of being missed.
+            contours, _ = cv.findContours(mask_u8, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
             outline_mask = np.zeros((height, width), dtype=np.uint8)
             cv.drawContours(outline_mask, contours, -1, 255, thickness=config.sam2_outline_thickness)
 

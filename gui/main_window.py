@@ -146,6 +146,11 @@ class MainWindow(QMainWindow):
         self.face_checkbox.setChecked(config.use_face_blur_default)
         controls_row.addWidget(self.face_checkbox)
 
+        self.sam2_checkbox = QCheckBox("Use EdgeTAM/SAM2 segmentation")
+        self.sam2_checkbox.setChecked(config.use_sam2)
+        self.sam2_checkbox.toggled.connect(self._on_sam2_toggled)
+        controls_row.addWidget(self.sam2_checkbox)
+
         controls_row.addStretch(1)
 
         self.confirm_btn = QPushButton("Confirm && Queue \u2192 Next video")
@@ -235,6 +240,8 @@ class MainWindow(QMainWindow):
             self.canvas._request_mask()
             self.canvas._redraw()
         self.face_checkbox.setChecked(job.use_face_blur)
+        self.sam2_checkbox.setChecked(job.use_sam2)
+        self.tabs.setTabEnabled(0, job.use_sam2)
 
         try:
             self.crop_trim_canvas.load_video(path)
@@ -243,6 +250,12 @@ class MainWindow(QMainWindow):
             self._log(f"Could not load {filename} for crop/trim: {e}")
 
     # ------------------------------------------------------------
+    def _on_sam2_toggled(self, checked: bool) -> None:
+        # Points are meaningless without SAM2 to consume them - gray
+        # out the tab rather than let the user pick points that will
+        # silently be ignored.
+        self.tabs.setTabEnabled(0, checked)
+
     def _confirm_and_next(self) -> None:
         if self.current_filename is None:
             return
@@ -256,6 +269,7 @@ class MainWindow(QMainWindow):
             prompt_points=list(self.canvas.points),
             prompt_labels=list(self.canvas.labels),
             use_face_blur=self.face_checkbox.isChecked(),
+            use_sam2=self.sam2_checkbox.isChecked(),
             crop_rect=self.crop_trim_canvas.crop_rect,
             trim_start_frame=self.crop_trim_canvas.trim_start_frame,
             trim_end_frame=self.crop_trim_canvas.trim_end_frame,
