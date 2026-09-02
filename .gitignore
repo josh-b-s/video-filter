@@ -1,4 +1,7 @@
 .idea
 output
-archived
-/*.mp3
+build/
+dist/
+videos
+*.spec
+video_jobs.json

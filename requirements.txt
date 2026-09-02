@@ -1,11 +1,18 @@
-opencv-contrib-python
-numpy
-tqdm
-mediapipe
-torch
-torchvision
-timm
-PySide6
-pyinstaller
-# EdgeTAM installed separately, see README.md:
-#   git clone https://github.com/facebookresearch/EdgeTAM.git && cd EdgeTAM && pip install -e .
+# torch and torchvision are installed separately by install_dependencies.py
+# (that's the one place a CPU vs CUDA build choice actually matters -
+# don't add them here or the installer script's choice gets overridden).
+
+PySide6>=6.5
+opencv-python>=4.8
+numpy>=1.24
+mediapipe>=0.10
+tqdm>=4.65
+timm>=0.9          # EdgeTAM's image encoder backbone dependency
+
+# EdgeTAM isn't on PyPI - vendored directly in this repo at EdgeTAM/
+# (project root, alongside app.py) rather than pulled from git, so the
+# client's install doesn't depend on GitHub being reachable or a
+# commit still existing there. -e installs it editable from that
+# local path; pip still needs the folder to contain EdgeTAM's own
+# setup.py/pyproject.toml, which it does out of the box.
+-e ./EdgeTAM

@@ -13,7 +13,7 @@ Edit this file for the settings that should apply to every video.
 # INPUT / OUTPUT
 # ============================================================
 
-input_folder = "materials/videos"      # folder the GUI scans for videos to pick/queue
+input_folder = "videos"      # folder the GUI scans for videos to pick/queue
 output_folder = "output"
 
 sam2_frame_extraction_dir = "output/_sam2_frames"
