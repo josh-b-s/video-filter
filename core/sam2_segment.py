@@ -86,9 +86,23 @@ class Sam2Segmenter:
             return self._predictor
         from sam2.build_sam import build_sam2_video_predictor
 
+        if self.config.device == "cpu":
+            # torch.cuda.is_available() decided this at Sam2Config
+            # creation time (see the device field default) - logging
+            # WHY here, not just what, so a slow run doesn't need a
+            # separate investigation to find out whether the GPU was
+            # ever in play at all.
+            try:
+                cuda_reason = "no CUDA-capable torch build installed" if not torch.backends.cuda.is_built() \
+                    else "no CUDA device detected (no GPU, or driver too old for this torch build)"
+            except Exception:
+                cuda_reason = "torch.cuda.is_available() returned False"
+            logger.warning("Running SAM2 on CPU (%s) - this will be much slower than GPU.", cuda_reason)
+
         logger.info(
-            "Loading SAM2 video predictor (%s)%s...",
+            "Loading SAM2 video predictor (%s) on device=%s%s...",
             self.config.model_config_path,
+            self.config.device,
             " [vos_optimized]" if self.config.vos_optimized else "",
         )
         self._predictor = build_sam2_video_predictor(

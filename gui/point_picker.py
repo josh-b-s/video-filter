@@ -144,6 +144,16 @@ class PointPickerCanvas(QWidget):
         self._mask_thread.request(self.frame_bgr, self.points, self.labels)
 
     def _on_mask_ready(self, mask, request_id: int) -> None:
+        if mask is not None and self.frame_bgr is not None and mask.shape[:2] != self.frame_bgr.shape[:2]:
+            # Stale result: computed for a frame that's since been
+            # replaced (e.g. the user switched to a different video,
+            # a different resolution, while this mask was still being
+            # computed on a background thread). Applying it would
+            # crash _redraw()'s boolean-index assignment below, since
+            # a differently-shaped mask can't index this frame -
+            # discard it instead. A fresh, correctly-shaped mask for
+            # the new frame follows shortly from the next click.
+            return
         self.current_mask = mask
         self._redraw()
 
