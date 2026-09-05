@@ -5,3 +5,5 @@ dist/
 videos
 *.spec
 video_jobs.json
+dist_portable
+portable

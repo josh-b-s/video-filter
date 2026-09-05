@@ -1,4 +1,9 @@
 # Edge-art video pipeline
+
+Restructured for one-responsibility-per-file, plus a GUI for
+non-technical people to pick SAM2 prompt points per video and queue
+them for background processing.
+
 ## For the client (no Python required)
 
 If you received a zipped `EdgeArtPicker` folder:
@@ -71,9 +76,20 @@ Picked points, crop/trim range, and per-video toggles persist to
 app resumes where you left off (anything left "queued"/"processing"
 from a previous session is automatically re-queued on startup).
 
-## Packaging as a standalone .exe
+## Packaging for the client
 
-See `build_exe.md`.
+Two options - see whichever doc matches what you're building:
+
+- `build_portable.md` - ships a real (minimal) Python interpreter
+  alongside the actual source files. Recommended: avoids all of
+  PyInstaller's freezing quirks (hidden imports, Hydra's dynamic
+  target-string loading, torch.jit.script needing real source text),
+  since it just runs your .py files normally.
+- `build_exe.md` - a single PyInstaller-built .exe. More "one file
+  feel" but more fragile to build and rebuild correctly.
+
+Either way, the client-facing workflow is the same - see "What
+non-technical users do" in `build_exe.md`.
 
 ## Headless / render-box use
 

@@ -10,6 +10,22 @@ Packaging into a standalone .exe: see build_exe.md.
 import os
 import sys
 
+# Point Hugging Face Hub's cache at a bundled "hf_cache" folder next
+# to this file (or next to the exe, if frozen), and force offline
+# mode - without this, timm's backbone (loaded by EdgeTAM's
+# TimmBackbone) hits huggingface.co at runtime to fetch its weights,
+# which means the client needs an internet connection the first time
+# SAM2 runs. Pre-downloading that weight into hf_cache/ during
+# packaging (see warm_hf_cache.py / build_portable.md) and forcing
+# offline mode here means the shipped package never needs network
+# access at all. Must be set before huggingface_hub/timm get imported
+# anywhere (including transitively) - both are lazy-imported later via
+# core/sam2_segment.py, but env vars set here at process start are
+# visible to those later imports regardless.
+_app_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+os.environ.setdefault("HF_HOME", os.path.join(_app_dir, "hf_cache"))
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 # When packaged with PyInstaller's --windowed flag, there's no console
 # window, so sys.stdout/sys.stderr are None - any print() or logging
 # call that writes to them crashes with "'NoneType' object has no
