@@ -26,19 +26,22 @@ _app_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "froze
 os.environ.setdefault("HF_HOME", os.path.join(_app_dir, "hf_cache"))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-# When packaged with PyInstaller's --windowed flag, there's no console
-# window, so sys.stdout/sys.stderr are None - any print() or logging
+# When there's no console attached - either a PyInstaller --windowed
+# build, or (our case) pythonw.exe from the embeddable-Python portable
+# build - sys.stdout/sys.stderr are None, and any print() or logging
 # call that writes to them crashes with "'NoneType' object has no
-# attribute 'write'". Redirect both to a log file next to the exe
-# instead: fixes the crash, and gives an actual file to check when
-# something goes wrong (there's no console to see it in otherwise).
-# Running from source (not frozen) is unaffected - sys.frozen is only
-# set inside a PyInstaller build.
-if getattr(sys, "frozen", False):
-    log_path = os.path.join(os.path.dirname(sys.executable), "app.log")
+# attribute 'write'". Checking for None directly (rather than the
+# PyInstaller-only sys.frozen flag) catches both cases. Redirect both
+# to a log file next to this file instead: fixes the crash, and gives
+# an actual file to check when something goes wrong (there's no
+# console to see it in otherwise). Running with a real console
+# (python.exe, or `python app.py` from a normal terminal) is
+# unaffected, since stdout/stderr are already real file objects there.
+if sys.stdout is None or sys.stderr is None:
+    log_path = os.path.join(_app_dir, "app.log")
     log_file = open(log_path, "a", buffering=1, encoding="utf-8")
-    sys.stdout = log_file
-    sys.stderr = log_file
+    sys.stdout = sys.stdout or log_file
+    sys.stderr = sys.stderr or log_file
 
 # Must happen before torch is imported anywhere (including
 # transitively, via core/sam2_segment.py etc.) - PYTORCH_JIT=0 makes

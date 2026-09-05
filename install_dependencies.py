@@ -82,8 +82,18 @@ def install_requirements() -> None:
 def install_torch(build: str) -> None:
     index_url = TORCH_INDEX_URLS[build]
     print(f"\nInstalling torch/torchvision ({build}) from {index_url} ...")
+    # --force-reinstall --no-deps: without --force-reinstall, pip sees
+    # any already-installed version satisfying the (unpinned) torch
+    # requirement and silently skips this install entirely - even if
+    # that installed version is the plain CPU wheel pulled in earlier
+    # by EdgeTAM's unpinned "torch>=2.3.1" dependency. This is exactly
+    # what happened here: the CUDA install step ran and printed
+    # "Requirement already satisfied", never actually installing the
+    # CUDA build. --no-deps avoids redundantly reinstalling everything
+    # torch/torchvision depend on.
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", *TORCH_PACKAGES, "--index-url", index_url],
+        [sys.executable, "-m", "pip", "install", *TORCH_PACKAGES, "--index-url", index_url,
+         "--force-reinstall", "--no-deps"],
         check=True,
     )
 

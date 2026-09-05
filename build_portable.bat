@@ -49,8 +49,17 @@ rem The embeddable distribution ships with site-packages support
 rem commented out by default (it's meant for embedding, not general
 rem use) - uncomment "import site" in the ._pth file so anything we
 rem pip-install becomes importable.
+rem
+rem We also append ".." to it. A ._pth file, when present, completely
+rem replaces Python's normal sys.path setup - including the usual
+rem automatic addition of the running script's own directory. app.py
+rem and the gui/core/tools/EdgeTAM packages live one level up from this
+rem python\ folder (in .data\, once packaged) - without an explicit ".."
+rem entry here, none of that project code is importable even though
+rem pip-installed packages under Lib\site-packages work fine.
 for %%f in ("%PORTABLE_DIR%\python*._pth") do (
     powershell -Command "(Get-Content '%%f') -replace '#import site', 'import site' | Set-Content '%%f'"
+    powershell -Command "Add-Content '%%f' '..'"
 )
 
 echo === Bootstrapping pip ===
@@ -63,11 +72,31 @@ echo === Installing dependencies ===
 if exist ".venv\Lib\site-packages" (
     echo Found .venv - copying already-installed packages instead of
     echo re-downloading anything.
-    robocopy ".venv\Lib\site-packages" "%PORTABLE_DIR%\Lib\site-packages" /E /NFL /NDL /NJH /NJS
+    rem /R:2 /W:2 - robocopy's default is ~1,000,000 retries with a 30s
+    rem wait each, so a single locked/in-use file (e.g. venv open in an
+    rem IDE) makes it look "stuck" instead of failing fast. Dropping
+    rem /NFL /NDL so real per-file errors are visible instead of hidden.
+    robocopy ".venv\Lib\site-packages" "%PORTABLE_DIR%\Lib\site-packages" /E /R:2 /W:2 /NJH /NJS
     rem robocopy's "success" exit codes are 0-7, not just 0 - anything
     rem 8+ is a real failure, so check against that instead of ERRORLEVEL 1.
     if !ERRORLEVEL! GEQ 8 (
         echo ERROR: robocopy failed copying site-packages - see output above.
+        exit /b 1
+    )
+
+    rem Belt-and-suspenders: robocopy's exit code reflects the whole job,
+    rem not any one package, so also verify the specific packages that
+    rem have bitten us before (PySide6 needs its shiboken6 sibling
+    rem package, which is easy to end up missing without any errorlevel
+    rem >= 8 being raised).
+    if exist ".venv\Lib\site-packages\PySide6" if not exist "%PORTABLE_DIR%\Lib\site-packages\PySide6" (
+        echo ERROR: PySide6 exists in .venv but did not get copied to %PORTABLE_DIR%\Lib\site-packages.
+        exit /b 1
+    )
+    if exist ".venv\Lib\site-packages\shiboken6" if not exist "%PORTABLE_DIR%\Lib\site-packages\shiboken6" (
+        echo ERROR: shiboken6 exists in .venv but did not get copied to %PORTABLE_DIR%\Lib\site-packages.
+        echo Re-run this script - if it fails again, check for a locked file under .venv\Lib\site-packages\shiboken6
+        echo ^(e.g. close PyCharm/any process using the venv^) and retry.
         exit /b 1
     )
 ) else (
